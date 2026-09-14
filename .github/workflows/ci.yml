@@ -28,6 +28,12 @@ jobs:
   test:
     name: test / ${{ matrix.os }} / py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    # 强制 Python 全链路使用 UTF-8。
+    # 代码与测试输出里有中文，Windows runner 默认 cp1252 编码会直接
+    # UnicodeEncodeError 让测试失败，必须显式指定。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false      # 一个平台失败不影响另一个平台继续跑完
       matrix:
