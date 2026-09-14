@@ -5,6 +5,14 @@ import pandas as pd
 from ..token import load_token
 
 
+class TushareCallError(RuntimeError):
+    """tushare 接口在重试耗尽后仍失败
+
+    专门用一个异常类型，便于调用方区分"接口失败（应重试/跳过，不写断点）"
+    与"接口正常返回空（确实没有数据，可以标记完成）"。
+    """
+
+
 class TushareClient:
     def __init__(self, calls_per_min: int = 200):
         self.calls_per_min = calls_per_min
@@ -30,23 +38,42 @@ class TushareClient:
         self._timestamps.append(now)
 
     def call(self, api_name: str, max_retries: int = 3, **params) -> pd.DataFrame:
-        """调用 tushare 接口（限流+重试）"""
+        """调用 tushare 接口（限流 + 重试）
+
+        修正要点
+        --------
+        旧实现里限频分支是 `time.sleep(5); continue`：若重试次数耗尽，
+        `for` 循环自然结束 → **隐式返回 None**。调用方普遍写成
+            if df is None or df.empty: self.storage.mark_done(code)
+        于是"网络抖动导致重试耗尽"被当成"这只股票没有数据"，
+        **被永久标记为已完成，再也不会重下**。
+
+        现在：重试真正耗尽时**抛异常**；调用方的 except 会跳过该股票且不写断点，
+        下次运行还会再试。只有 API 正常返回空 DataFrame 才算"确实没有数据"。
+
+        另外：每次尝试都重新限流，旧实现只在进循环前 wait() 一次，
+        重试是绕过限流的。
+        """
         pro = self.get_pro()
-        self._wait()
+        last_err = None
         for attempt in range(max_retries + 1):
+            self._wait()                       # 每次尝试都限流
             try:
                 fn = getattr(pro, api_name)
                 df = fn(**params)
                 return df if df is not None else pd.DataFrame()
             except Exception as e:
+                last_err = e
+                if attempt >= max_retries:
+                    break
                 msg = str(e)
                 if "最多" in msg or "每分钟" in msg or "频率" in msg:
-                    time.sleep(5)
-                    continue
-                if attempt < max_retries:
-                    time.sleep(2 + random.uniform(0, 1))
+                    time.sleep(5 + random.uniform(0, 1))
                 else:
-                    raise
+                    time.sleep(2 + random.uniform(0, 1))
+        raise TushareCallError(
+            f"tushare {api_name} 重试 {max_retries} 次仍失败: {last_err}"
+        ) from last_err
 
     # 高频封装：常用接口
     def daily_basic(self, ts_code, start, end):
