@@ -92,9 +92,10 @@ RECIPES = {
     "limit_price": {
         "dataset": "limit",
         "desc": "涨跌停价（由清洗层日线派生）",
-        "source": "cleaned/daily_basic",
-        "rules": "主板±10% / 创业板·科创板±20% / 北交所±30% / ST±5%",
-        "producer": "database/downloader/meta.py, scripts/daily_update.py",
+        "source": "cleaned/daily_basic（tushare 官方 pre_close，已按除权调整）",
+        "rules": ("科创板/创业板±20% / 北交所±30% / 主板ST±5% / 主板±10%，"
+                  "按昨收（除权后参考价）四舍五入到分"),
+        "producer": "scripts/rebuild_limit.py（全量）、scripts/daily_update.py（增量）",
     },
     # 已废弃的 akshare 日线下载器（DailyDownloader）的输出。
     # 单独开一个配方目录，避免它的前复权数据混进 daily_basic 造成双重复权。

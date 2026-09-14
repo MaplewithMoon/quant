@@ -38,8 +38,9 @@ import argparse
 import pandas as pd
 from data.dataset import DataSet
 from data.preprocessor import Preprocessor, fillna, add_technical_indicators
-from backtest.engine import BacktestEngine
+from backtest.engine import BacktestEngine, FILL_NEXT_OPEN, FILL_SAME_CLOSE
 from backtest.metrics import Metrics
+from execution.market_rules import MarketRules
 from risk.manager import RiskManager, MaxDrawdownRule, MaxPositionSizeRule
 from analytics.visualizer import Visualizer
 from utils.logger import setup_logger
@@ -81,23 +82,33 @@ DEFAULT_PARAMS = {
 }
 
 
-def load_dataset(symbol: str, start: str, end: str, adjust: str = "qfq"):
+def load_dataset(symbol: str, start: str, end: str, adjust: str = "qfq",
+                 with_status: bool = True):
     """从数据库加载数据并预处理
 
     参数:
-        symbol:  股票代码（如 '300750'）
-        start:   起始日期 'YYYY-MM-DD'
-        end:     结束日期 'YYYY-MM-DD'
-        adjust:  'qfq'=前复权(默认)，''=不复权原始价
+        symbol:      股票代码（如 '300750'）
+        start:       起始日期 'YYYY-MM-DD'
+        end:         结束日期 'YYYY-MM-DD'
+        adjust:      'qfq'=前复权(默认)，''=不复权原始价
+        with_status: 是否挂载涨跌停价/停牌标记（供回测的制度约束使用）
 
     流程:
         1. DataSet.from_db → 从清洗层读原始价 + frozen 复权因子现场算前复权
-        2. Preprocessor → 填充缺失 + 添加技术指标(SMA/EMA/MACD/RSI/布林带/ATR)
+        2. load_trading_status → 对齐 cleaned/limit_price 与 frozen/suspend
+        3. Preprocessor → 填充缺失 + 添加技术指标(SMA/EMA/MACD/RSI/布林带/ATR)
 
     返回:
-        预处理后的 DataSet（data 是 OHLCV + 指标列的 DataFrame，index=交易日）
+        预处理后的 DataSet（data 含 OHLCV + 指标 + limit_up/limit_down/suspended）
     """
     ds = DataSet.from_db(symbol, start, end, adjust=adjust)
+    if with_status:
+        try:
+            from database.loader import load_trading_status
+            # 涨跌停价必须换算到与价格相同的复权空间，否则会误判
+            ds.attach_market_status(load_trading_status(symbol, start, end, adjust=adjust))
+        except Exception as e:
+            print(f"[警告] 交易日状态加载失败，涨跌停/停牌约束将不生效: {e}")
     pp = Preprocessor().add(fillna()).add(add_technical_indicators)
     return pp.run(ds)
 
@@ -127,7 +138,9 @@ def make_strategy(name: str, params: dict):
 
 
 def run_backtest(ds, strategy, capital, commission, slippage, risk,
-                 min_commission=5.0, verbose=False):
+                 min_commission=5.0, verbose=False,
+                 fill_timing=FILL_NEXT_OPEN, apply_rules=True,
+                 truncate_data=True):
     """执行一次完整回测
 
     参数:
@@ -139,16 +152,22 @@ def run_backtest(ds, strategy, capital, commission, slippage, risk,
         risk:           True=启用风控（回撤15%限 + 单笔仓位30%限）
         min_commission: 单笔最低佣金（默认5元）
         verbose:        是否打印中间日志
+        fill_timing:    成交时点，"next_open"(默认) / "same_close"
+        apply_rules:    True=启用 A股制度约束（T+1/涨跌停/停牌/一手取整）
+        truncate_data:  True=喂给策略的数据只到当前 bar（封堵未来函数）
 
     返回:
         (engine, trades, equity, metrics)
-        engine:  回测引擎（含 portfolio/broker 状态）
+        engine:  回测引擎（含 portfolio/broker/rejections 状态）
         trades:  交易记录 DataFrame
-        equity:  逐日净值曲线 Series
+        equity:  逐日净值曲线 Series（引擎唯一账本）
         metrics: Metrics 绩效对象
     """
     engine = BacktestEngine(initial_capital=capital, commission=commission,
-                            slippage=slippage, min_commission=min_commission)
+                            slippage=slippage, min_commission=min_commission,
+                            fill_timing=fill_timing,
+                            market_rules=MarketRules(enabled=apply_rules),
+                            truncate_data=truncate_data)
     if risk:
         # 风控规则链：最大回撤超15%禁止开仓 + 单笔仓位不超过总资产30%
         engine.risk_manager = RiskManager([
@@ -245,7 +264,20 @@ def main():
     parser.add_argument("--capital", type=float, default=1_000_000, help="初始资金")
     parser.add_argument("--commission", type=float, default=0.0001, help="佣金费率(默认万分之一)")
     parser.add_argument("--min-commission", type=float, default=5.0, help="单笔最低佣金(默认5元)")
+    parser.add_argument("--stamp-duty", type=float, default=0.0005,
+                        help="印花税率，仅卖出单边(默认0.05%%)")
+    parser.add_argument("--transfer-fee", type=float, default=0.00001,
+                        help="过户费率，双边(默认0.001%%)")
     parser.add_argument("--slippage", type=float, default=0.001, help="滑点")
+    # 撮合/制度参数
+    parser.add_argument("--fill-timing", default=FILL_NEXT_OPEN,
+                        choices=[FILL_NEXT_OPEN, FILL_SAME_CLOSE],
+                        help="成交时点: next_open=次日开盘成交(默认,无未来函数), "
+                             "same_close=当日收盘成交(旧行为)")
+    parser.add_argument("--no-rules", action="store_true",
+                        help="关闭 A股制度约束(T+1/涨跌停/停牌/一手取整)，用于对照")
+    parser.add_argument("--no-truncate", action="store_true",
+                        help="不截断喂给策略的数据（允许策略看到未来行，仅用于调试）")
     # 行为参数
     parser.add_argument("--risk", action="store_true", help="开启风控")
     parser.add_argument("--plot", action="store_true", help="显示净值曲线")
@@ -255,6 +287,11 @@ def main():
 
     logger = setup_logger("backtest")
     params = json.loads(args.params) if args.params else {}
+    bt_kwargs = dict(
+        fill_timing=args.fill_timing,
+        apply_rules=not args.no_rules,
+        truncate_data=not args.no_truncate,
+    )
 
     # ============ 模式一：多策略对比 ============
     if args.compare:
@@ -267,7 +304,7 @@ def main():
                 strat = make_strategy(name, None)
                 _, trades, equity, m = run_backtest(
                     ds, strat, args.capital, args.commission, args.slippage,
-                    args.risk, args.min_commission)
+                    args.risk, args.min_commission, **bt_kwargs)
                 rows.append({"策略": name, "收益": m.total_return, "夏普": m.sharpe_ratio,
                              "卡尔玛": m.calmar_ratio, "回撤": m.max_drawdown,
                              "交易": m.total_trades, "胜率": m.win_rate})
@@ -286,7 +323,16 @@ def main():
     strategy = make_strategy(args.strategy, params)
     engine, trades, equity, metrics = run_backtest(
         ds, strategy, args.capital, args.commission, args.slippage,
-        args.risk, args.min_commission)
+        args.risk, args.min_commission, **bt_kwargs)
+
+    # 制度约束拦截汇总（把"为什么没成交"讲清楚）
+    if engine.rejections.items:
+        print("\n[制度约束] 被拦下的委托:")
+        for reason, n in sorted(engine.rejections.summary().items(),
+                                key=lambda kv: -kv[1]):
+            print(f"    {n:>4} 次  {reason}")
+    if engine.pending_cancelled:
+        print(f"\n[制度约束] 最后 1 根 bar 的信号无下一根 bar 可成交，已作废")
 
     logger.info(f"策略: {strategy.name}  交易次数: {len(trades)}")
     logger.info(f"回测结果:\n{fmt_metrics(metrics)}")

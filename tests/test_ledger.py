@@ -72,11 +72,9 @@ def test_equity_curve_equals_portfolio():
     assert len(eq) == len(ds), f"每个 bar 都应有权益快照: {len(eq)} vs {len(ds)}"
     assert engine.ledger_gap < 1e-6, f"账目差额 {engine.ledger_gap:,.6f}"
     assert abs(eq.iloc[-1] - engine.portfolio.total_value) < 1e-6
-    # 第 0 根 bar 就成交了 → 权益 = 初始资金 - 该笔的滑点与费用（这才是正确记账）
-    traded_on_bar0 = not engine._equity == [] and eq.iloc[0] != 100_000
-    if traded_on_bar0:
-        cost_drag = 100_000 - eq.iloc[0]
-        assert 0 < cost_drag < 100_000 * 0.01, f"首日成本拖累异常: {cost_drag}"
+    # next_open 模式下第 0 根 bar 只产生委托、不成交 → 权益仍等于初始资金
+    assert abs(eq.iloc[0] - 100_000) < 1e-9, \
+        f"第 0 根 bar 尚未成交，权益应为初始资金，实际 {eq.iloc[0]:,.2f}"
     print(f"[OK] 净值曲线与账户一致: {eq.iloc[-1]:,.2f} (gap={engine.ledger_gap:.2e}, "
           f"点数={len(eq)})")
 
@@ -120,7 +118,7 @@ def test_round_trip_costs_money():
     trades = engine.run(ds, BuyThenSell())
 
     final = engine.portfolio.total_value
-    fees = float(trades["commission"].sum())
+    fees = float(trades["fee"].sum())        # 合计费用 = 佣金 + 印花税 + 过户费
 
     assert fees > 0, "应产生手续费"
     assert final < 100_000, f"价格不变时不应盈利，实际 {final:,.2f}"
@@ -141,8 +139,8 @@ def test_commission_sign_on_sell():
     assert o.filled_amount > 0
     assert o.commission > 0
     assert o.sell_proceeds < o.filled_amount, "卖出净收入必须小于成交额"
-    assert abs(o.sell_proceeds - (o.filled_amount - o.commission)) < 1e-9
-    print(f"[OK] 卖出: 成交额 {o.filled_amount:,.2f} - 费用 {o.commission:,.2f} "
+    assert abs(o.sell_proceeds - (o.filled_amount - o.total_fee)) < 1e-9
+    print(f"[OK] 卖出: 成交额 {o.filled_amount:,.2f} - 费用 {o.total_fee:,.2f} "
           f"= 净收入 {o.sell_proceeds:,.2f}")
 
 
@@ -176,7 +174,7 @@ def test_buy_rejects_insufficient_cash():
     from portfolio.portfolio import Portfolio
     p = Portfolio(1_000)
     try:
-        p.buy("TEST", 1000, 10.0, commission=5.0)   # 需要 10005，只有 1000
+        p.buy("TEST", 1000, 10.0, fees=5.0)   # 需要 10005，只有 1000
         raise AssertionError("应当抛出 ValueError")
     except ValueError as e:
         assert "现金不足" in str(e)

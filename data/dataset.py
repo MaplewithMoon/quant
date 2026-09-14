@@ -94,6 +94,37 @@ class DataSet:
         self.data = out
         return self
 
+    def attach_market_status(self, status: pd.DataFrame) -> "DataSet":
+        """把交易日状态（涨跌停价 / 停牌标记）按交易日对齐到日线
+
+        Args:
+            status: 含 trade_date（或 DatetimeIndex）与 limit_up/limit_down/
+                    suspended 等列的表，例如 database.loader.load_trading_status()
+
+        Returns:
+            self（便于链式调用）
+
+        注意: **不做前向填充**。涨跌停价必须逐日精确，用前值填充会把
+              不该拦的交易拦掉（或反之），因此这里用普通左连接。
+        """
+        if status is None or len(status) == 0:
+            return self
+        if not isinstance(self.data.index, pd.DatetimeIndex):
+            raise TypeError("attach_market_status 要求 DataSet.data 的索引是交易日")
+
+        s = status.copy()
+        if "trade_date" in s.columns:
+            s["trade_date"] = pd.to_datetime(s["trade_date"])
+            s = s.set_index("trade_date")
+        s.index = pd.to_datetime(s.index)
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+
+        cols = [c for c in s.columns if c not in self.data.columns]
+        if not cols:
+            return self
+        self.data = self.data.join(s[cols], how="left")
+        return self
+
     @classmethod
     def load(cls, symbol: str, start: str, end: str, freq: str = "1d",
              source: Optional[DataSource] = None) -> "DataSet":

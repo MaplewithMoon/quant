@@ -35,7 +35,9 @@ class Order:
     created_at: datetime = field(default_factory=datetime.now)
     filled_qty: float = 0.0
     filled_amount: float = 0.0      # 成交额 = Σ(数量 × 成交价)，**不含任何费用**
-    commission: float = 0.0         # 累计交易费用（佣金/印花税/过户费）
+    commission: float = 0.0         # 佣金（双边）
+    stamp_duty: float = 0.0         # 印花税（仅卖出）
+    transfer_fee: float = 0.0       # 过户费（双边）
 
     @property
     def is_active(self) -> bool:
@@ -52,14 +54,19 @@ class Order:
         return self.filled_amount / self.filled_qty if self.filled_qty else 0.0
 
     @property
+    def total_fee(self) -> float:
+        """合计交易费用 = 佣金 + 印花税 + 过户费"""
+        return self.commission + self.stamp_duty + self.transfer_fee
+
+    @property
     def buy_cost(self) -> float:
         """买入总支出 = 成交额 + 费用"""
-        return self.filled_amount + self.commission
+        return self.filled_amount + self.total_fee
 
     @property
     def sell_proceeds(self) -> float:
         """卖出净收入 = 成交额 - 费用"""
-        return self.filled_amount - self.commission
+        return self.filled_amount - self.total_fee
 
     def fill(self, qty: float, price: float):
         self.filled_qty += qty

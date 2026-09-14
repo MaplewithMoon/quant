@@ -159,6 +159,73 @@ def load_valuation(code: str, start: str = None, end: str = None) -> pd.DataFram
     return df.reset_index(drop=True)
 
 
+def load_limit_price(code: str, start: str = None, end: str = None) -> pd.DataFrame:
+    """读取涨跌停价（cleaned 层配方 limit_price，由清洗层日线派生）
+
+    返回列: trade_date, pre_close, limit_up, limit_down
+    """
+    files = list(dir_of("limit").glob(f"year=*/{code}.parquet"))
+    if not files:
+        return pd.DataFrame()
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df = df.sort_values("trade_date").drop_duplicates("trade_date")
+    if start:
+        df = df[df["trade_date"] >= pd.to_datetime(start)]
+    if end:
+        df = df[df["trade_date"] <= pd.to_datetime(end)]
+    return df.reset_index(drop=True)
+
+
+def load_trading_status(code: str, start: str = None, end: str = None,
+                        adjust: str = "qfq") -> pd.DataFrame:
+    """读取交易日状态：涨跌停价 + 停牌标记（供回测的制度约束使用）
+
+    返回列: trade_date, limit_up, limit_down, suspended
+
+    参数:
+        adjust: 涨跌停价所在的价格空间，必须与回测用的价格一致！
+                'qfq' 前复权（默认）/ '' 不复权
+
+    为什么需要 adjust 参数:
+        `cleaned/limit_price` 是从**不复权**清洗层派生的，而回测默认用前复权价。
+        若不换算就直接比较，等于拿前复权价去比不复权涨停价 —— 有分红送转的
+        股票会被误判（例如 002644 在 2024-03-12 前复权开盘 8.2574 会被当成
+        "超过不复权涨停 8.25"）。这里用与 to_qfq() 完全相同的因子把涨跌停价
+        缩放到同一空间。
+
+    注意:
+        - 停牌来自 frozen/suspend
+        - **不做前向填充**：涨跌停价必须逐日精确，用前值填充会误拦交易
+        - 已知局限：limit_price 用 `pre_close = 昨收` 计算，除权除息日的
+          交易所参考价与之不同，因此除权日的涨跌停价本身可能有偏差
+    """
+    lim = load_limit_price(code, start, end)
+    if lim.empty:
+        return pd.DataFrame(columns=["trade_date", "limit_up", "limit_down", "suspended"])
+
+    out = lim[["trade_date", "limit_up", "limit_down"]].copy()
+    out = out.sort_values("trade_date").reset_index(drop=True)
+
+    # 把涨跌停价换算到与回测价格相同的复权空间
+    if adjust == "qfq":
+        fac = load_factor(code)
+        if not fac.empty:
+            merged = pd.merge_asof(out, fac.sort_values("trade_date"),
+                                   on="trade_date", direction="backward")
+            f = merged["factor"].fillna(1.0).to_numpy()
+            out["limit_up"] = (out["limit_up"].to_numpy() * f).round(4)
+            out["limit_down"] = (out["limit_down"].to_numpy() * f).round(4)
+
+    sus = load_suspend(code)
+    if not sus.empty and "trade_date" in sus.columns:
+        sus_days = set(pd.to_datetime(sus["trade_date"]).dt.normalize())
+        out["suspended"] = out["trade_date"].dt.normalize().isin(sus_days).astype(int)
+    else:
+        out["suspended"] = 0
+    return out
+
+
 def industry_median_factor(factor_col: str, date: str, industry_col: str = "industry") -> dict:
     """策略3: 计算某日各行业的因子中位数，用于填充缺失值
     基于 frozen 层 valuation（各股票因子）+ stocks 行业归属
