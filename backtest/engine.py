@@ -49,11 +49,13 @@ class BacktestEngine:
         fill_timing: str = FILL_NEXT_OPEN,
         market_rules: Optional[MarketRules] = None,
         truncate_data: bool = True,
+        slippage_model=None,
+        max_participation: float = 0.10,
     ):
         """回测引擎
 
         commission:     佣金费率（默认万分之一）
-        slippage:       滑点（默认 0.1%）
+        slippage:       固定滑点（默认 0.1%）；当 slippage_model 传入时本参数被忽略
         min_commission: 单笔最低佣金（默认 5 元）
         stamp_duty:     印花税，仅卖出单边（默认 0.05%）
         transfer_fee:   过户费，双边（默认 0.001%）
@@ -63,12 +65,18 @@ class BacktestEngine:
                         传 MarketRules(enabled=False) 可关闭做对照
         truncate_data:  喂给策略的数据只保留到当前 bar。
                         True 可从物理上封堵"策略偷看未来"的通道。
+        slippage_model: 成交价模型（execution/impact.py）。
+                        传 SqrtImpact(k) 启用平方根市场冲击成本；
+                        默认 None = 固定比例滑点（与历史行为一致）
+        max_participation: 单笔最多吃掉当日成交量的比例（默认 10%，0=不限）
         """
         self.initial_capital = initial_capital
         self.broker = SimulatedBroker(
             slippage=slippage, commission=commission, min_commission=min_commission,
             stamp_duty=stamp_duty, transfer_fee=transfer_fee,
             lot_size=(market_rules or MarketRules()).lot_size,
+            slippage_model=slippage_model,
+            max_participation=max_participation,
         )
         self.portfolio = Portfolio(initial_capital)
         self.logger = setup_logger("backtest")
@@ -161,9 +169,19 @@ class BacktestEngine:
         return report
 
     # ---------- 撮合 ----------
+    @staticmethod
+    def _bar_volume(bar):
+        """取当前 bar 的成交量（股），缺失时返回 None"""
+        try:
+            v = float(bar.get("volume"))
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(v) else v
+
     def _execute(self, signal, bar, ref_price: float, symbol: str):
         """在参考价上尝试撮合一个信号；被制度约束拦下时记入 rejections"""
         held = self.portfolio.position_size(symbol)
+        volume = self._bar_volume(bar)
 
         if signal.action == Action.BUY:
             if held > 0:
@@ -172,13 +190,15 @@ class BacktestEngine:
             if not ok:
                 self.rejections.add(bar.name, "buy", why)
                 return None
-            size = self.broker.max_affordable_size(self.portfolio.cash, ref_price)
+            size = self.broker.max_affordable_size(self.portfolio.cash, ref_price, volume)
+            # 参与率上限：单笔最多吃掉当日成交量的固定比例
+            size = min(size, self.broker.max_tradable_size(volume, is_buy=True))
             if size <= 0:
                 return None
             order = Order(symbol=symbol, side=OrderSide.BUY, size=size,
                           order_type=OrderType.MARKET, price=ref_price)
             self.broker.place_order(order)
-            filled = self.broker.execute(order, ref_price)
+            filled = self.broker.execute(order, ref_price, volume)
             self.portfolio.buy(symbol, filled.filled_qty, filled.avg_fill_price,
                                fees=filled.total_fee)
             self.fees_paid += filled.total_fee
@@ -200,10 +220,13 @@ class BacktestEngine:
             if not ok:
                 self.rejections.add(bar.name, "sell", why)
                 return None
-            order = Order(symbol=symbol, side=OrderSide.SELL, size=sellable,
+            size = min(sellable, self.broker.max_tradable_size(volume, is_buy=False))
+            if size <= 0:
+                return None
+            order = Order(symbol=symbol, side=OrderSide.SELL, size=size,
                           order_type=OrderType.MARKET, price=ref_price)
             self.broker.place_order(order)
-            filled = self.broker.execute(order, ref_price)
+            filled = self.broker.execute(order, ref_price, volume)
             pnl = self.portfolio.sell(symbol, filled.filled_qty, filled.avg_fill_price,
                                       fees=filled.total_fee)
             self.fees_paid += filled.total_fee

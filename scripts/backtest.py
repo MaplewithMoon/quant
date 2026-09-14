@@ -41,6 +41,7 @@ from data.preprocessor import Preprocessor, fillna, add_technical_indicators
 from backtest.engine import BacktestEngine, FILL_NEXT_OPEN, FILL_SAME_CLOSE
 from backtest.metrics import Metrics
 from execution.market_rules import MarketRules
+from execution.impact import build_model
 from risk.manager import RiskManager, MaxDrawdownRule, MaxPositionSizeRule
 from analytics.visualizer import Visualizer
 from utils.logger import setup_logger
@@ -140,7 +141,8 @@ def make_strategy(name: str, params: dict):
 def run_backtest(ds, strategy, capital, commission, slippage, risk,
                  min_commission=5.0, verbose=False,
                  fill_timing=FILL_NEXT_OPEN, apply_rules=True,
-                 truncate_data=True):
+                 truncate_data=True, slippage_model=None,
+                 max_participation=0.10):
     """执行一次完整回测
 
     参数:
@@ -148,13 +150,15 @@ def run_backtest(ds, strategy, capital, commission, slippage, risk,
         strategy:       策略实例
         capital:        初始资金
         commission:     佣金费率（默认万分之一 = 0.0001）
-        slippage:       滑点（默认0.1%）
+        slippage:       固定滑点（默认0.1%）；传入 slippage_model 时忽略
         risk:           True=启用风控（回撤15%限 + 单笔仓位30%限）
         min_commission: 单笔最低佣金（默认5元）
         verbose:        是否打印中间日志
         fill_timing:    成交时点，"next_open"(默认) / "same_close"
         apply_rules:    True=启用 A股制度约束（T+1/涨跌停/停牌/一手取整）
         truncate_data:  True=喂给策略的数据只到当前 bar（封堵未来函数）
+        slippage_model: 成交价模型（execution.impact），None=固定滑点
+        max_participation: 单笔最多吃掉当日成交量的比例（默认 10%）
 
     返回:
         (engine, trades, equity, metrics)
@@ -167,7 +171,9 @@ def run_backtest(ds, strategy, capital, commission, slippage, risk,
                             slippage=slippage, min_commission=min_commission,
                             fill_timing=fill_timing,
                             market_rules=MarketRules(enabled=apply_rules),
-                            truncate_data=truncate_data)
+                            truncate_data=truncate_data,
+                            slippage_model=slippage_model,
+                            max_participation=max_participation)
     if risk:
         # 风控规则链：最大回撤超15%禁止开仓 + 单笔仓位不超过总资产30%
         engine.risk_manager = RiskManager([
@@ -278,6 +284,13 @@ def main():
                         help="关闭 A股制度约束(T+1/涨跌停/停牌/一手取整)，用于对照")
     parser.add_argument("--no-truncate", action="store_true",
                         help="不截断喂给策略的数据（允许策略看到未来行，仅用于调试）")
+    # 冲击成本 / 流动性
+    parser.add_argument("--impact-model", default="fixed", choices=["fixed", "sqrt", "none"],
+                        help="成交价模型: fixed=固定滑点(默认), sqrt=平方根市场冲击, none=零滑点")
+    parser.add_argument("--impact-k", type=float, default=0.1,
+                        help="平方根冲击系数 k（默认0.1；下单量占成交量1%%时冲击约1%%）")
+    parser.add_argument("--max-participation", type=float, default=0.10,
+                        help="单笔最多吃掉当日成交量的比例(默认10%%，0=不限)")
     # 行为参数
     parser.add_argument("--risk", action="store_true", help="开启风控")
     parser.add_argument("--plot", action="store_true", help="显示净值曲线")
@@ -291,6 +304,9 @@ def main():
         fill_timing=args.fill_timing,
         apply_rules=not args.no_rules,
         truncate_data=not args.no_truncate,
+        slippage_model=build_model(args.impact_model, rate=args.slippage,
+                                   k=args.impact_k),
+        max_participation=args.max_participation,
     )
 
     # ============ 模式一：多策略对比 ============
