@@ -15,6 +15,7 @@ TESTS = [
     "tests/test_ledger.py",
     "tests/test_market_rules.py",
     "tests/test_impact.py",
+    "tests/test_optimizer.py",
 ]
 
 
