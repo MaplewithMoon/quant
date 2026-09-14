@@ -1,5 +1,7 @@
 # 让 Git 自动识别文本/二进制，避免行尾与编码被破坏
-* text=auto
+# eol=lf：仓库内和工作区统一使用 LF，Windows 上也不会被自动转成 CRLF
+#         （CI 在 Linux 上跑，统一 LF 可避免"整文件行尾变化"的假 diff）
+* text=auto eol=lf
 
 # ---- 二进制：禁止任何转换 ----
 *.parquet binary
