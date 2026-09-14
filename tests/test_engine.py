@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """测试：回测引擎 + 订单执行"""
 import sys, io, os
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+# 不在 import 阶段替换 sys.stdout（会破坏 pytest 的输出捕获，见 test_loader.py 注释）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -100,6 +100,7 @@ def test_order_state_machine():
 
 
 if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")  # 修正 Windows 控制台中文编码
     test_buy_and_hold_positive()
     test_commission_min()
     test_engine_metrics()

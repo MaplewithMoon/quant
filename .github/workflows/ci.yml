@@ -46,10 +46,11 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       # 只装 pyproject 里声明的依赖 —— 这就是在验证 pyproject 是不是写全了
-      - name: 安装依赖（pip install -e .）
+      # [dev] 额外带入 pytest / ruff
+      - name: 安装依赖（pip install -e ".[dev]"）
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e ".[dev]"
 
       - name: 依赖一致性检查
         run: python -m pip check
@@ -59,8 +60,13 @@ jobs:
         run: |
           python -c "import database.loader, database.storage, data.dataset, data.preprocessor, backtest.engine, backtest.metrics, backtest.lookahead, strategy.classic, strategy.modern, execution.broker, portfolio.portfolio, risk.manager, analytics.visualizer; print('全部框架模块导入成功')"
 
-      # 注意：测试用 mocks 造数据，不读 db/、不联网，所以能在 CI 里跑
+      # 注意：测试用 mocks 造数据，不读 db/、不联网，所以能在 CI 里跑。
+      # 测试配置（testpaths / pythonpath）来自 pyproject.toml 的 [tool.pytest.ini_options]
       - name: 单元测试
+        run: python -m pytest -v
+
+      # 项目自带的运行器也跑一遍，确保两种入口都可用
+      - name: 单元测试（项目自带 run_tests.py）
         run: python scripts/run_tests.py
 
   # ---------------------------------------------------------------------------

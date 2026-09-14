@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """测试：数据加载与复权"""
 import sys, io, os
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+# 不要在 import 阶段替换 sys.stdout：pytest 会在导入时接管 stdout，
+# 替换后其捕获机制会抛 "ValueError: I/O operation on closed file"。
+# 脚本直跑时的编码修正放到文件末尾的 __main__ 分支里。
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -58,6 +60,7 @@ def test_align_valuation():
 
 
 if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")  # 修正 Windows 控制台中文编码
     test_dataset_ohlcv()
     test_high_low_consistency()
     test_qfq_computation()
