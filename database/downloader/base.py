@@ -49,7 +49,8 @@ class BaseDownloader:
     """所有下载器的基类"""
 
     def __init__(self, dataset: str, name: str = "", calls_per_min: int = 60):
-        self.storage = Storage(dataset)
+        # 下载器是唯一被允许写入只读 frozen 层的角色
+        self.storage = Storage(dataset, allow_frozen=True)
         self.limiter = RateLimiter(calls_per_min)
         self.logger = setup_logger(name or dataset)
         self.start_year = DATA_START_YEAR

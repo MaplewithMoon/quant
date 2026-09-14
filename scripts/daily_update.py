@@ -6,8 +6,8 @@
      - daily_raw: tushare daily（不复权原始价）
      - valuation: tushare daily_basic（每日估值）
      - adjust:    tushare adj_factor（复权因子）
-  2. 重建清洗层 db/daily（仅当年，从 frozen 派生 + 清洗）
-  3. 重建涨跌停价 db/limit（仅当年，由清洗层计算）
+  2. 重建清洗层 db/cleaned/daily_basic（仅当年，从 frozen 派生 + 清洗）
+  3. 重建涨跌停价 db/cleaned/limit_price（仅当年，由清洗层计算）
 
 用法:
     python scripts/daily_update.py                  # 更新全部（默认今天）
@@ -25,10 +25,16 @@ import pandas as pd
 import tushare as ts
 from tqdm import tqdm
 from database.token import load_token
+from database.config import FROZEN_ROOT, dir_of, parquet_glob
 from scripts._tushare_common import RateLimiter, api_call, ts_code_of, check_disk
 
-DB = Path("db")
-FROZEN = DB / "frozen"
+# 路径统一走 database.config，禁止再手写 "db/xxx" 字符串
+DB = FROZEN_ROOT.parent                 # db/
+FROZEN = FROZEN_ROOT                    # db/frozen             只读原始层
+CLEANED_DAILY = dir_of("daily")         # db/cleaned/daily_basic
+LIMIT_DIR = dir_of("limit")             # db/cleaned/limit_price
+BACKUP_DIR = CLEANED_DAILY.parent / ".daily_backup"
+DAILY_GLOB = parquet_glob(CLEANED_DAILY)
 
 
 def live_codes():
@@ -146,7 +152,7 @@ def clean_file(df):
 def rebuild_cleaned_year(year):
     """重建清洗层某一年（从 frozen/daily_raw 派生）"""
     src = FROZEN / "daily_raw" / f"year={year}"
-    dst = DB / "daily" / f"year={year}"
+    dst = CLEANED_DAILY / f"year={year}"
     if not src.exists():
         return
     os.makedirs(dst, exist_ok=True)
@@ -164,12 +170,12 @@ def rebuild_cleaned_year(year):
 def backup_daily():
     """重建前备份清洗层（用于校验失败时回滚）"""
     import shutil
-    if not (DB / "daily").exists():
+    if not CLEANED_DAILY.exists():
         return None
-    tmp = DB / ".daily_backup"
+    tmp = BACKUP_DIR
     if tmp.exists():
         shutil.rmtree(tmp)
-    shutil.copytree(DB / "daily", tmp)
+    shutil.copytree(CLEANED_DAILY, tmp)
     return tmp
 
 
@@ -178,9 +184,9 @@ def rollback_daily(backup):
     import shutil
     if backup is None:
         return
-    if (DB / "daily").exists():
-        shutil.rmtree(DB / "daily")
-    shutil.move(str(backup), str(DB / "daily"))
+    if CLEANED_DAILY.exists():
+        shutil.rmtree(CLEANED_DAILY)
+    shutil.move(str(backup), str(CLEANED_DAILY))
     print("已回滚：清洗层恢复为更新前状态")
 
 
@@ -195,11 +201,11 @@ def run_validation():
 
     # 1) 逻辑一致性：OHLC/非负/三角（清洗层全查）
     try:
-        r = con.execute("""
+        r = con.execute(f"""
             WITH t AS (
                 SELECT open, high, low, close, volume, amount,
                        amount / NULLIF(volume, 0) AS vwap
-                FROM read_parquet('db/daily/year=*/*.parquet')
+                FROM read_parquet('{DAILY_GLOB}')
             )
             SELECT
                 sum(CASE WHEN close <= 0 THEN 1 ELSE 0 END),
@@ -217,10 +223,10 @@ def run_validation():
 
     # 2) 主键唯一性（code+trade_date）
     try:
-        dup = con.execute("""
+        dup = con.execute(f"""
             SELECT count(*) FROM (
                 SELECT code, trade_date, count(*) c
-                FROM read_parquet('db/daily/year=*/*.parquet')
+                FROM read_parquet('{DAILY_GLOB}')
                 GROUP BY code, trade_date HAVING count(*) > 1
             )
         """).fetchone()[0]
@@ -231,8 +237,8 @@ def run_validation():
 
     # 3) 数据新鲜度：清洗层最新日期不应滞后太多
     try:
-        latest = con.execute("""
-            SELECT max(trade_date) FROM read_parquet('db/daily/year=*/*.parquet')
+        latest = con.execute(f"""
+            SELECT max(trade_date) FROM read_parquet('{DAILY_GLOB}')
         """).fetchone()[0]
         gap = (datetime.date.today() - latest.date()).days if latest else 999
         if gap > 10:
@@ -250,8 +256,8 @@ def run_validation():
 # ============ 重建涨跌停价（仅当年） ============
 def rebuild_limit_year(year):
     """从清洗层日线计算涨跌停价（主板±10%，创业板/科创板±20%，北交所±30%）"""
-    src = DB / "daily" / f"year={year}"
-    dst = DB / "limit" / f"year={year}"
+    src = CLEANED_DAILY / f"year={year}"
+    dst = LIMIT_DIR / f"year={year}"
     if not src.exists():
         return
     os.makedirs(dst, exist_ok=True)

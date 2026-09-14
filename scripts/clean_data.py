@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """行情数据逻辑一致性校验与清理
 
 检查项:
@@ -23,7 +23,12 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+from database.config import FROZEN_ROOT, dir_of
+
 DB = Path("db")
+DAILY_DIR = dir_of("daily")            # db/cleaned/daily_basic（清洗后日线）
+ADJUST_DIR = FROZEN_ROOT / "adjust"    # db/frozen/adjust（只读）
+DIVIDEND_DIR = FROZEN_ROOT / "dividend"
 LOG = []
 
 
@@ -77,15 +82,15 @@ def check_triangle(df, code, year, tol=0.05):
 # ============================================================
 def check_factor_jump(codes=None):
     """因子跳变日必须有对应分红送转事件（全量遍历）"""
-    adjust_files = glob.glob("db/frozen/adjust/year=*/*.parquet")
-    codes_all = sorted({f.split("\\")[-1][:-8] for f in adjust_files})
+    adjust_files = sorted(ADJUST_DIR.glob("year=*/*.parquet"))
+    codes_all = sorted({f.stem for f in adjust_files})
     if codes:
         codes_all = [c for c in codes_all if c in codes]
     print(f"复权因子跳变检查: 全量 {len(codes_all)} 只股票", flush=True)
 
     issues = 0
     for i, code in enumerate(codes_all):
-        af = [f for f in adjust_files if f.endswith(f"{code}.parquet")]
+        af = [f for f in adjust_files if f.stem == code]
         if not af:
             continue
         adj = pd.concat([pd.read_parquet(f) for f in af], ignore_index=True)
@@ -100,7 +105,7 @@ def check_factor_jump(codes=None):
         jumps = adj[adj["factor"].notna() & adj["factor_prev"].notna() & (rel.abs() - 1 > 0.001)]
 
         # 分红送转事件（除权除息日 ex_date）
-        div_files = [f for f in glob.glob("db/frozen/dividend/year=*/*.parquet") if f.endswith(f"{code}.parquet")]
+        div_files = list(DIVIDEND_DIR.glob(f"year=*/{code}.parquet"))
         div_dates = set()
         if div_files:
             dv = pd.concat([pd.read_parquet(f) for f in div_files], ignore_index=True)
@@ -128,19 +133,19 @@ def check_factor_jump(codes=None):
 # 清理入口
 # ============================================================
 def process_daily(mode, codes=None, year=None, verbose=50):
-    files = glob.glob("db/daily/year=*/*.parquet")  # 清洗层原始价日线（口径一致）
+    files = sorted(DAILY_DIR.glob("year=*/*.parquet"))  # 清洗层原始价日线（口径一致）
     if year:
-        files = [f for f in files if f"year={year}" in f]
+        files = [f for f in files if f.parent.name == f"year={year}"]
     if codes:
-        files = [f for f in files if f.split("\\")[-1][:-8] in codes]
+        files = [f for f in files if f.stem in codes]
 
     total_bad = 0
     total_files = len(files)
     log(f"扫描 {total_files} 个日线文件 (mode={mode})")
     for i, f in enumerate(files):
         df = pd.read_parquet(f)
-        code = f.split("\\")[-1][:-8]
-        y = f.split("\\")[-2].split("=")[1]
+        code = f.stem
+        y = f.parent.name.split("=")[1]
         if df.empty:
             continue
 

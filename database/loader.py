@@ -1,19 +1,24 @@
 """数据库加载器：读取原始价 + 复权因子，现场计算前复权
 
-方案A数据模型：
-  db/daily/   = 原始价 + 原始量额（一致，三角校验可过）
-  db/adjust/  = 复权因子
+数据分层：
+  db/cleaned/daily_basic/  = 清洗后日线：原始价 + 原始量额（口径一致，三角校验可过）
+  db/frozen/adjust/        = 复权因子（原始）
   前复权价 = 原始价 × factor / factor_latest
+
+路径一律走 database.config，不要在别处手写 "db/xxx" 字符串。
 """
 import pandas as pd
 from pathlib import Path
 
-DB = Path(__file__).resolve().parent.parent / "db"
+from .config import FROZEN_ROOT, dir_of
+
+DB = FROZEN_ROOT.parent            # db/ 根目录
+CLEANED_DAILY = dir_of("daily")    # db/cleaned/daily_basic
 
 
 def load_raw_daily(code: str, start: str = None, end: str = None) -> pd.DataFrame:
-    """读取原始价日线（按年/代码分区）"""
-    files = list((DB / "daily").glob(f"year=*/{code}.parquet"))
+    """读取清洗后原始价日线（按年/代码分区）"""
+    files = list(CLEANED_DAILY.glob(f"year=*/{code}.parquet"))
     if not files:
         return pd.DataFrame()
     dfs = []

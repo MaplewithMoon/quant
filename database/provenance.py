@@ -11,7 +11,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DB = Path(__file__).resolve().parent.parent / "db"
+from .config import dir_of
+
 META_NAME = "_meta.json"
 
 
@@ -22,24 +23,25 @@ def stamp_cleaned(meta: dict = None) -> Path:
         meta: 附加元数据（如来源、清洗规则版本）
 
     写入:
-        db/daily/_meta.json
+        db/cleaned/daily_basic/_meta.json
     """
     info = {
         "layer": "cleaned",
+        "recipe": "daily_basic",
         "source_layer": "frozen",
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "generation_timestamp": int(time.time()),
         "script": "scripts/rebuild_cleaned.py",
         **((meta or {}))
     }
-    path = DB / "daily" / META_NAME
+    path = dir_of("daily") / META_NAME
     path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
 def get_stamp(dataset: str = "daily") -> dict:
     """读取数据集的时间戳元数据"""
-    path = DB / dataset / META_NAME
+    path = dir_of(dataset) / META_NAME
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
     return {}
@@ -53,7 +55,7 @@ def stamp_dataset(dataset: str, meta: dict) -> Path:
         "generation_timestamp": int(time.time()),
         **meta,
     }
-    path = DB / dataset / META_NAME
+    path = dir_of(dataset) / META_NAME
     path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 

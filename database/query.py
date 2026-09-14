@@ -10,7 +10,10 @@ class QueryEngine:
 
     def query(self, sql: str, params=None):
         """对数据库执行 SQL。
-        支持 glob 语法直接查 Parquet：SELECT * FROM 'db/daily/year=2024/*.parquet'
+
+        支持 glob 语法直接查 Parquet：
+            SELECT * FROM 'db/cleaned/daily_basic/year=2024/*.parquet'
+        路径请用 database.config.parquet_glob() 生成，不要手写字符串。
         """
         con = duckdb.connect(self.db_path)
         try:

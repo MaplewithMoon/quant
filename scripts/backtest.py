@@ -1,8 +1,8 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """完整回测入口：从数据库取数，支持任意策略/参数/风控/可视化
 
 【整体流程】
-    数据库清洗层 (db/daily) + 复权因子 (frozen/adjust)
+    数据库清洗层 (db/cleaned/daily_basic) + 复权因子 (frozen/adjust)
         ↓  DataSet.from_db(adjust='qfq')  现场算前复权
     加载原始OHLCV
         ↓  Preprocessor 预处理

@@ -18,8 +18,21 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
+from database.config import dir_of, parquet_glob
+
 DB = Path("db")
+DAILY_DIR = dir_of("daily")                  # db/cleaned/daily_basic
+DAILY_ALL_GLOB = parquet_glob(DAILY_DIR)
 WARN = []
+
+
+def _dataset_dir(dataset: str) -> Path:
+    """把逻辑数据集名解析成实际目录
+
+    'daily'             -> db/cleaned/daily_basic（走清洗配方路由）
+    'frozen/valuation'  -> db/frozen/valuation（带斜杠的按原样拼接）
+    """
+    return DB / dataset if "/" in dataset else dir_of(dataset)
 
 def log(msg):
     print(f"  {msg}")
@@ -35,14 +48,14 @@ def report(name, ok, detail=""):
 # ============================================================
 def check_uniqueness(dataset: str, key_cols=("code", "trade_date"), quick=False):
     print(f"\n[唯一性] {dataset}")
-    files = list((DB / dataset).rglob("*.parquet"))
+    files = list(_dataset_dir(dataset).rglob("*.parquet"))
     if not files:
         report(f"{dataset}", False, "无文件")
         return
     # 用 DuckDB 全量扫描（快）
     import duckdb
     con = duckdb.connect()
-    glob_pat = str(DB / dataset / "**" / "*.parquet")
+    glob_pat = str(_dataset_dir(dataset) / "**" / "*.parquet")
     try:
         cols_sql = ", ".join(key_cols)
         df = con.execute(f"""
@@ -82,10 +95,10 @@ def check_schema(dataset: str, quick=False):
     if not spec:
         report(dataset, False, "无Schema定义")
         return
-    files = list((DB / dataset).rglob("*.parquet"))
+    files = list(_dataset_dir(dataset).rglob("*.parquet"))
     import duckdb
     con = duckdb.connect()
-    glob_pat = str(DB / dataset / "**" / "*.parquet")
+    glob_pat = str(_dataset_dir(dataset) / "**" / "*.parquet")
     issues = 0
 
     # 1) 必填列存在性（读取失败 = 有文件列不一致）
@@ -144,7 +157,7 @@ def check_coverage(quick=True, sample_days=10, sample_stocks=30):
 
     # 用 DuckDB 汇总日线各日股票数
     import duckdb
-    files = list((DB / "daily").rglob("*.parquet"))
+    files = list(DAILY_DIR.rglob("*.parquet"))
     if not files:
         report("日线", False, "无文件")
         return
@@ -154,9 +167,10 @@ def check_coverage(quick=True, sample_days=10, sample_stocks=30):
     sample_years = years[-2:]  # 最近两年
     date_counts = {}
     for y in sample_years:
+        yg = parquet_glob(DAILY_DIR / f"year={y}")
         df = con.execute(f"""
             SELECT trade_date, count(DISTINCT code) AS n
-            FROM read_parquet('db/daily/year={y}/*.parquet')
+            FROM read_parquet('{yg}')
             GROUP BY trade_date ORDER BY trade_date
         """).fetchdf()
         for _, r in df.iterrows():
@@ -183,9 +197,9 @@ def check_coverage(quick=True, sample_days=10, sample_stocks=30):
             log(f"  {key}: {n} 只 / 应有~{expected} ({ratio:.0%})")
 
     # 逐股覆盖（全量，DuckDB 一次分组统计）
-    per_code = con.execute("""
+    per_code = con.execute(f"""
         SELECT code, count(*) AS actual, min(trade_date) AS min_d, max(trade_date) AS max_d
-        FROM read_parquet('db/daily/year=*/*.parquet')
+        FROM read_parquet('{DAILY_ALL_GLOB}')
         GROUP BY code
     """).fetchdf()
     per_code["min_d"] = pd.to_datetime(per_code["min_d"])

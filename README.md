@@ -18,24 +18,49 @@ python scripts/backtest_demo.py                            # 6个教学案例
 python scripts/run_tests.py                                # 单元测试
 ```
 
-## 数据模型（frozen 原始层 + 清洗层）
+## 数据模型（三层：frozen 原始层 / cleaned 加工层 / _legacy 归档）
 
-**分层架构：frozen 只读可信源（tushare 原始），工作层可重建**
+**分层架构：frozen 只读可信源（数据源原样），cleaned 按"清洗配方"分目录且可重建**
 
 ```
-db/frozen/              冻结原始层（不可变、只读、tushare 原始数据）
-    daily_raw/          tushare 不复权原始价（可信源）
-    adjust/             tushare 原始复权因子 (adj_factor)
-    valuation/          tushare 每日估值（原始单位万元）
-    dividend/ suspend/ st/ index_cons/ index_daily/
-    industry/ financial/ margin/ holders/ calendar/ stocks/
-    etf/ options/       tushare 基金/期权
-    _MANIFEST.json      下载记录/规则声明
-db/daily/               清洗后: 原始价 + 原始量额（口径一致，三角校验通过）
-db/limit/               派生: 涨跌停价
+db/
+├── _MANIFEST.json          全库说明（层级 / 规则 / 只读约定）
+│
+├── frozen/                 ① 原始层 —— 只读，仅下载器可写
+│   ├── daily_raw/          tushare 不复权原始价（可信源）
+│   ├── adjust/             tushare 原始复权因子 (adj_factor)
+│   ├── valuation/          tushare 每日估值（原始单位：万元 / turnover_rate）
+│   ├── st/  dividend/  suspend/  stocks/  calendar/
+│   ├── financial/  holders/  margin/  northbound/  industry/
+│   ├── index_cons/  index_daily/  etf/  futures/  options/
+│   └── _MANIFEST.json
+│
+├── cleaned/                ② 加工层 —— 按清洗配方分子目录，可从 frozen 重建
+│   ├── _RECIPES.json       配方登记表（来源 / 规则 / 产出脚本）
+│   ├── daily_basic/        配方 daily_basic：清洗后日线（原始价 + 原始量额）
+│   └── limit_price/        配方 limit_price：涨跌停价（由 daily_basic 派生）
+│
+└── _legacy/                ③ 历史归档 —— frozen 层建立前的旧管线产物，不再更新
+    ├── _README.md
+    ├── valuation_norm/     旧估值（市值已换算成亿元、turnover_rate→turnover）
+    ├── st_flagged/         旧 ST（多一列派生 is_st）
+    └── etf_akshare/        旧 ETF 行情（akshare 源，中文列名）
 ```
 
-**frozen 层规则**：禁止修改/删除已有记录；只允许增量追加新交易日；清洗/转换必须输出到其他层。
+**为什么按"清洗配方"分目录**：同一份原始数据用不同方式加工，口径完全不同
+（估值有"万元原样"和"亿元归一"、日线有"不复权"和"前复权"）。混在一个目录里
+就无法判断读到的是哪一种——本项目历史上 `db/daily` 就同时被写入过前复权价和
+不复权价，导致 `load_daily(adjust='qfq')` 出现双重复权。现在一种清洗方式独占一个
+目录，目录名 = 配方名。
+
+**frozen 层规则**（由代码强制，不只是约定）：
+- 禁止修改/删除已有记录，只允许增量追加新交易日
+- 清洗/转换必须输出到 `cleaned/` 下的配方目录
+- 分析/回测代码写 frozen 会直接抛 `FrozenWriteError`
+  （只有下载器用 `Storage(..., allow_frozen=True)` 才能写）
+
+**新增一种清洗方式**：在 `database/config.py` 的 `RECIPES` 里登记一条，
+产出目录自动变成 `db/cleaned/<配方名>/`，详见 [`docs/数据结构说明.md`](docs/数据结构说明.md)。
 
 **下载脚本**：
 ```bash
@@ -69,7 +94,7 @@ python scripts/validate_data.py        # 主键唯一/Schema/覆盖率
 
 | 缺失类型 | 处理 | 当前状态 |
 |---|---|---|
-| 停牌导致缺失 | 不填充，停牌日无K线（删除了占位K线）；停牌事件在 `db/suspend/` | ✅ 全天停牌无K线 |
+| 停牌导致缺失 | 不填充，停牌日无K线（删除了占位K线）；停牌事件在 `db/frozen/suspend/` | ✅ 全天停牌无K线 |
 | 上市前/退市后 | 无记录，用NaN而非0 | ✅ 全库价格0值=0 |
 | 因子/财务真缺失 | 保留NaN（亏损股PE无意义），`fill_factor_nan()` 可按行业中位数填充 | ✅ 24.5% PE NaN 保留 |
 | 单根K线缺失 | 无插值（缺失即无记录），不伪造数据 | ✅ 天然符合 |
@@ -240,40 +265,47 @@ python scripts/run_download.py --fresh
 
 | 数据集 | 主源 | 次源 | 说明 |
 |---|---|---|---|
-| 交易日历/股票列表 | akshare新浪 | — | 8797天 / 5550只 |
-| 个股日线(前复权) | akshare新浪 | baostock | 双源交叉校验，差异>0.5%时以新浪为准 |
-| 复权因子/分红 | baostock | — | query_adjust_factor |
-| 每日估值 | tushare | akshare百度 | 完整字段需 TUSHARE_TOKEN；无token仅PE/PB/总市值 |
-| 财务报表 | akshare东财 | — | 三表约300字段，含重试 |
-| 指数/行业 | akshare | — | 成分权重/日K/申万分类 |
+| 交易日历/股票列表 | tushare | — | `trade_cal` / `stock_basic` |
+| 个股日线(不复权) | tushare | — | `daily`，落 `frozen/daily_raw`（量=股 / 额=元） |
+| 复权因子/分红 | tushare | — | `adj_factor` / `dividend` |
+| 每日估值 | tushare | akshare百度 | `daily_basic`；无 TUSHARE_TOKEN 时仅 PE/PB/总市值 |
+| 财务报表 | tushare | — | `balancesheet`/`income`/`cashflow` |
+| 指数/行业 | tushare | — | 成分权重/日K/申万分类 |
+| 涨跌停价 | 由清洗层派生 | — | 配方 `limit_price`，落 `cleaned/limit_price` |
 
 ### 查询示例
 
 ```python
 from database.query import QueryEngine
+from database.config import dir_of, parquet_glob
+
 qe = QueryEngine()
 
-# 单只股票某年
-df = qe.query("""
+# 单只股票某年（清洗后日线）
+df = qe.query(f"""
     SELECT trade_date, open, high, low, close
-    FROM 'db/daily_qfq/year=2024/000001.parquet'
+    FROM '{parquet_glob(dir_of('daily') / 'year=2024')}'
 """)
 
 # 跨年查询全部
-df = qe.query("""
+df = qe.query(f"""
     SELECT code, count(*) AS n
-    FROM read_parquet('db/daily_qfq/year=*/*.parquet')
+    FROM read_parquet('{parquet_glob(dir_of('daily'))}')
     GROUP BY code
 """)
 
 # 估值 + 行情 表连接
-df = qe.query("""
+df = qe.query(f"""
     SELECT d.trade_date, d.close, v.pe_ttm, v.total_mv
-    FROM 'db/daily_qfq/year=2024/000001.parquet' d
-    JOIN 'db/valuation/year=2024/000001.parquet' v
+    FROM '{parquet_glob(dir_of('daily') / 'year=2024')}' d
+    JOIN '{parquet_glob(dir_of('valuation') / 'year=2024')}' v
       ON d.trade_date = v.trade_date
 """)
 ```
+
+> 注意：**不要手写 `'db/xxx/...'` 路径字符串**，一律用
+> `database.config.dir_of()` 取目录、`parquet_glob()` 生成 DuckDB glob。
+> 这样以后调整目录结构时只需改 `config.py` 一处。
 
 ### 存储结构
 

@@ -11,7 +11,9 @@ class DailyDownloader(BaseDownloader):
     """
 
     def __init__(self, use_qfq: bool = True):
-        dataset = "daily" if use_qfq else "daily"
+        # 用独立的 dataset 名，输出到 db/cleaned/daily_akshare_legacy/，
+        # 绝不与 daily_basic（清洗层标准日线）混用，避免复权口径混淆
+        dataset = "daily_akshare"
         super().__init__(dataset, "daily", calls_per_min=50)
         self.use_qfq = use_qfq
         self._bs_logged_in = False
