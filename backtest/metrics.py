@@ -93,14 +93,21 @@ class Metrics:
         dd_duration = _max_drawdown_duration(drawdown)
         rec_time = _recovery_time(equity_curve)
 
-        total_trades = len(trades[trades["action"].isin(["buy", "sell"])]) // 2 \
-            if not trades.empty else 0
+        # 胜率 / 盈亏比只在"已平仓"交易上计算。
+        # 修正：旧实现把买入行也算进分母，而买入行的 pnl 恒为 0，
+        # 于是胜率被稀释近一半（实测报 19.05%，真实 40%）。
+        if not trades.empty and "action" in trades.columns:
+            closed = trades[trades["action"] == "sell"]
+        else:
+            closed = trades.iloc[0:0]
 
-        if not trades.empty and "pnl" in trades.columns:
-            pnl_series = trades["pnl"]
+        total_trades = len(closed)
+
+        if total_trades and "pnl" in closed.columns:
+            pnl_series = closed["pnl"]
             wins = pnl_series[pnl_series > 0]
             losses = pnl_series[pnl_series < 0]
-            win_rate = len(wins) / len(pnl_series) if len(pnl_series) > 0 else 0.0
+            win_rate = len(wins) / len(pnl_series)
             profit_factor = (wins.sum() / abs(losses.sum())
                              if len(losses) > 0 and losses.sum() != 0 else float("inf"))
         else:

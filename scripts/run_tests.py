@@ -12,6 +12,7 @@ TESTS = [
     "tests/test_loader.py",
     "tests/test_preprocessor.py",
     "tests/test_engine.py",
+    "tests/test_ledger.py",
 ]
 
 

@@ -156,51 +156,10 @@ def run_backtest(ds, strategy, capital, commission, slippage, risk,
             MaxPositionSizeRule(max_position_pct=0.3),
         ])
     trades = engine.run(ds, strategy)
-    equity = build_equity_curve(ds, trades, capital)
+    # 净值曲线由引擎逐 bar 产生（唯一账本）；不再用成交记录重推一遍
+    equity = engine.equity_curve
     metrics = Metrics.compute(equity, trades)
     return engine, trades, equity, metrics
-
-
-def build_equity_curve(ds, trades, initial_capital):
-    """根据交易记录构建逐日净值曲线
-
-    原理:
-        回测引擎只在买卖发生时记录成交（价格/数量），
-        净值曲线 = 现金 + 持仓市值，逐日重算，
-        这样把"离散的成交点"还原成"连续的资产曲线"。
-
-    参数:
-        ds:             预处理后的 DataSet（含每日 close）
-        trades:         回测返回的交易记录（buy/sell 事件）
-        initial_capital: 初始资金
-
-    返回:
-        净值曲线 pd.Series（index=交易日，value=当日总资产）
-    """
-    # 无交易 → 直接按收盘价涨幅等比缩放
-    if trades.empty:
-        return ds.data["close"] / ds.data["close"].iloc[0] * initial_capital
-
-    equity = pd.Series(index=ds.data.index, dtype=float)
-    equity.iloc[0] = initial_capital
-    balance, position = initial_capital, 0.0  # 现金余额 / 持仓股数
-
-    for i in range(1, len(ds.data)):
-        t = ds.data.index[i]
-        close = ds.data["close"].iloc[i]
-
-        # 该交易日是否有成交？有则更新现金和持仓
-        row = trades[trades.index == t]
-        if not row.empty:
-            action, price, size = row["action"].iloc[0], row["price"].iloc[0], row["size"].iloc[0]
-            if action == "buy":
-                position, balance = size, balance - size * price   # 买入：现金减少
-            elif action == "sell":
-                balance, position = balance + size * price, 0.0    # 卖出：现金增加，清仓
-
-        # 当日总资产 = 现金 + 持仓 × 当日收盘价
-        equity.iloc[i] = balance + position * close
-    return equity
 
 
 def auto_lookahead_report(ds, trades) -> str:

@@ -52,14 +52,17 @@ def test_buy_and_hold_positive():
 
 
 def test_commission_min():
-    """最低佣金5元生效"""
+    """最低佣金5元生效，且费用与成交额分开记账"""
     broker = SimulatedBroker(commission=0.0001, min_commission=5.0)
     o = Order(symbol="T", side=OrderSide.BUY, size=100, price=10.0)  # 1000元成交额
     broker.execute(o, 10.0)
-    turnover = 100 * 10 * 1.001
-    fee = o.filled_amount - turnover
-    assert abs(fee - 5.0) < 1e-6, f"应为最低5元, 实际{fee}"
-    print("[OK] 最低佣金5元")
+    turnover = 100 * 10 * 1.001          # 含 0.1% 滑点
+    # 修正：旧断言用 (filled_amount - turnover) 反推费用，等于把"佣金混进成交额"
+    # 这个 bug 当成了规范。现在费用单列在 order.commission 上。
+    assert abs(o.filled_amount - turnover) < 1e-6, "成交额不应包含佣金"
+    assert abs(o.commission - 5.0) < 1e-6, f"应为最低5元, 实际{o.commission}"
+    assert abs(o.avg_fill_price - 10.01) < 1e-6, "成交均价应为滑点后价格，不含费用"
+    print("[OK] 最低佣金5元（成交额与费用分列）")
 
 
 def test_engine_metrics():
