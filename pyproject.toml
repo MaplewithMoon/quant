@@ -1,0 +1,132 @@
+# =============================================================================
+#  pyproject.toml —— 项目唯一"事实来源"（single source of truth）
+#
+#  它同时承担四件事：
+#    1. [build-system] / [project]  → 依赖声明与打包元数据（取代 requirements.txt）
+#    2. [project.optional-dependencies] → 可选功能组（dev / talib / live）
+#    3. [tool.setuptools]          → 告诉 setuptools 哪些目录是要安装的包
+#    4. [tool.pytest] / [tool.ruff]→ 工具配置集中在这里，不再散落各处的 ini/cfg
+#
+#  常用命令：
+#    pip install -e ".[dev]"      # 可编辑安装 + 开发工具（推荐）
+#    pip install -e ".[dev,talib,live]"   # 连 ta-lib 和 vnpy 一起装
+#    pytest                       # 读下面的 [tool.pytest.ini_options]
+#    ruff check .                 # 读下面的 [tool.ruff]
+# =============================================================================
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+# -----------------------------------------------------------------------------
+#  项目元数据
+# -----------------------------------------------------------------------------
+[project]
+name = "quant"
+version = "0.1.0"
+description = "A股量化交易框架：Parquet + DuckDB 数据层、逐bar回测引擎、策略库与风控"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "yiwen" }]
+keywords = ["quant", "trading", "backtest", "a-share", "tushare"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+# 需要闭源/私有的话，在这里补 license 字段（当前刻意留空，由你决定）
+
+# -----------------------------------------------------------------------------
+#  运行依赖：装完即可跑通「下载 -> 清洗 -> 回测 -> 指标」
+#  注意：只写直接依赖，传递依赖交给解析器（精确版本见 requirements.lock.txt）
+# -----------------------------------------------------------------------------
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=3.0",          # 代码已在 pandas 3.0.3 上验证
+    "pyarrow>=15",          # Parquet 读写（db/ 全部是 parquet 分区）
+    "duckdb>=1.0",          # database/query.py 的 SQL 查询层
+    "matplotlib>=3.8",      # analytics/visualizer.py 画图
+    "tqdm>=4.60",           # 下载进度条
+    "tushare>=1.4",         # 主数据源
+    "akshare>=1.14",        # 备用数据源（ETF/期权/部分行情）
+    "baostock>=1.0",        # 备用数据源（双源交叉校验）
+]
+
+# -----------------------------------------------------------------------------
+#  可选依赖组：按需安装，不污染核心环境
+# -----------------------------------------------------------------------------
+[project.optional-dependencies]
+# 开发工具：pip install -e ".[dev]"
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+# 技术指标加速库（vnpy 也依赖它）。
+# 注意：Python 3.14 必须用 >=0.8，0.6.x 没有 cp314 预编译包，会尝试源码编译并失败
+talib = ["ta-lib>=0.8"]
+# 实盘/CTP 交易（会带入 PySide6 等约 200 MB 的 GUI 依赖）
+live = ["vnpy>=4.4.0"]
+
+
+# -----------------------------------------------------------------------------
+#  打包：显式声明要安装的顶层包
+#  这些包名很通用（data/config/utils），显式列出可避免误打包 db/ others/ 等目录
+# -----------------------------------------------------------------------------
+[tool.setuptools]
+packages = [
+    "analytics",
+    "backtest",
+    "config",
+    "data",
+    "data_statistics",
+    "database",
+    "database.downloader",
+    "execution",
+    "portfolio",
+    "risk",
+    "strategy",
+    "utils",
+]
+py-modules = ["main"]
+# scripts/ 故意不打包：它只做 CLI 编排，用 `python scripts/xxx.py` 从仓库根运行
+
+
+# -----------------------------------------------------------------------------
+#  pytest：pytest tests/ 或直接 pytest
+#  pythonpath 让 `from mocks import ...` 这类 tests/ 内部导入能工作
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+
+# -----------------------------------------------------------------------------
+#  ruff：静态检查（目前仅本地使用，尚未接入 CI 作为门禁）
+#  pip install -e ".[dev]" 后执行：ruff check .
+#  自动修复：ruff check . --fix
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+# 第三方源码、数据库、实验区不检查
+extend-exclude = [
+    "db",
+    "others",
+    "vnpy-4.4.0",
+    "方正证券FQT交易客户端-40438",
+    ".deps",
+]
+
+[tool.ruff.lint]
+# 先只开"能抓真 bug"的规则，避免一上来几千条噪音
+#   E4/E7/E9 = 导入、语句、语法层面的错误
+#   F        = pyflakes：未使用导入/变量、未定义名字（本次审查发现的死代码就能靠它抓）
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    "E402",  # 允许模块级 import 不在文件顶部（现有脚本大量 sys.path.insert 后 import）
+    "F401",  # 未使用导入：先只提示不阻断
+]

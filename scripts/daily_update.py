@@ -1,0 +1,341 @@
+# -*- coding: utf-8 -*-
+"""每日收盘后数据更新脚本
+
+流程:
+  1. 增量下载最近 N 天数据到 frozen（upsert，可重复运行安全）
+     - daily_raw: tushare daily（不复权原始价）
+     - valuation: tushare daily_basic（每日估值）
+     - adjust:    tushare adj_factor（复权因子）
+  2. 重建清洗层 db/daily（仅当年，从 frozen 派生 + 清洗）
+  3. 重建涨跌停价 db/limit（仅当年，由清洗层计算）
+
+用法:
+    python scripts/daily_update.py                  # 更新全部（默认今天）
+    python scripts/daily_update.py --date 2026-08-29
+    python scripts/daily_update.py --only valuation # 只更新估值
+    python scripts/daily_update.py --days 10        # 回看天数（默认15）
+"""
+import sys, io, os
+sys.path.insert(0, ".")
+
+import argparse
+import datetime
+from pathlib import Path
+import pandas as pd
+import tushare as ts
+from tqdm import tqdm
+from database.token import load_token
+from scripts._tushare_common import RateLimiter, api_call, ts_code_of, check_disk
+
+DB = Path("db")
+FROZEN = DB / "frozen"
+
+
+def live_codes():
+    st = pd.read_parquet(FROZEN / "stocks" / "year=2005" / "all.parquet")
+    st = st[~st["name"].astype(str).str.contains("退", na=False)]
+    return sorted(st["code"].astype(str).tolist())
+
+
+def upsert(dataset, code, df, date_col="trade_date"):
+    """把 df 按 code 分区 upsert 进 frozen/{dataset}/year={Y}/{code}.parquet"""
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    df["year"] = df[date_col].dt.year
+    for y, g in df.groupby("year"):
+        if y < 2005:
+            continue
+        part = FROZEN / dataset / f"year={int(y)}"
+        part.mkdir(parents=True, exist_ok=True)
+        path = part / f"{code}.parquet"
+        cols = [c for c in g.columns if c != "year"]
+        new = g[cols]
+        if path.exists():
+            old = pd.read_parquet(path)
+            old[date_col] = pd.to_datetime(old[date_col])
+            new_dates = set(pd.to_datetime(new[date_col]))
+            old = old[~old[date_col].isin(new_dates)]
+            merged = pd.concat([old, new], ignore_index=True).sort_values(date_col)
+        else:
+            merged = new.sort_values(date_col)
+        merged.to_parquet(path, index=False)
+
+
+# ============ 增量下载 ============
+def update_daily_raw(pro, codes, start, end):
+    limiter = RateLimiter()
+    print(f"\n[1/3] 更新 daily_raw（frozen，{len(codes)} 只）", flush=True)
+    updated = 0
+    for code in tqdm(codes, desc="daily_raw", ncols=100):
+        try:
+            df = api_call(pro, "daily", limiter, ts_code=ts_code_of(code),
+                          start_date=start, end_date=end)
+            if df is None or df.empty:
+                continue
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df["code"] = code
+            df["volume"] = df["vol"] * 100
+            df["amount"] = df["amount"] * 1000
+            cols = ["code", "trade_date", "open", "high", "low", "close",
+                    "pre_close", "change", "pct_chg", "volume", "amount"]
+            upsert("daily_raw", code, df[[c for c in cols if c in df.columns]])
+            updated += 1
+        except Exception as e:
+            print(f"  {code} 失败: {str(e)[:50]}", flush=True)
+    print(f"  daily_raw 更新 {updated} 只", flush=True)
+
+
+def update_valuation(pro, codes, start, end):
+    limiter = RateLimiter()
+    print(f"\n[2/3] 更新 valuation（frozen，{len(codes)} 只）", flush=True)
+    updated = 0
+    for code in tqdm(codes, desc="valuation", ncols=100):
+        try:
+            df = api_call(pro, "daily_basic", limiter, ts_code=ts_code_of(code),
+                          start_date=start, end_date=end,
+                          fields="trade_date,pe,pe_ttm,pb,ps,ps_ttm,total_mv,circ_mv,turnover_rate")
+            if df is None or df.empty:
+                continue
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df["code"] = code
+            upsert("valuation", code, df)
+            updated += 1
+        except Exception as e:
+            print(f"  {code} 失败: {str(e)[:50]}", flush=True)
+    print(f"  valuation 更新 {updated} 只", flush=True)
+
+
+def update_adjust(pro, codes, start, end):
+    limiter = RateLimiter()
+    print(f"\n[3/3] 更新 adjust（frozen，{len(codes)} 只）", flush=True)
+    updated = 0
+    for code in tqdm(codes, desc="adjust", ncols=100):
+        try:
+            df = api_call(pro, "adj_factor", limiter, ts_code=ts_code_of(code),
+                          start_date=start, end_date=end)
+            if df is None or df.empty:
+                continue
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df["code"] = code
+            upsert("adjust", code, df)
+            updated += 1
+        except Exception as e:
+            print(f"  {code} 失败: {str(e)[:50]}", flush=True)
+    print(f"  adjust 更新 {updated} 只", flush=True)
+
+
+# ============ 重建清洗层（仅当年） ============
+def clean_file(df):
+    if df.empty:
+        return df
+    bad = pd.Series(False, index=df.index)
+    vol = pd.to_numeric(df["volume"], errors="coerce")
+    bad |= vol.isna() | (vol == 0)
+    for c in ["open", "high", "low", "close"]:
+        v = pd.to_numeric(df[c], errors="coerce")
+        bad |= v.isna() | (v <= 0)
+    o, h, l, cl = (pd.to_numeric(df[c], errors="coerce") for c in ["open", "high", "low", "close"])
+    vok = o.notna() & h.notna() & l.notna() & cl.notna()
+    bad |= vok & ~(h >= l) | vok & ~(l <= o) | vok & ~(o <= h) | vok & ~(l <= cl) | vok & ~(cl <= h)
+    amt = pd.to_numeric(df["amount"], errors="coerce")
+    vwap = amt / vol.replace(0, pd.NA)
+    bad |= vwap.notna() & vok & ~((vwap >= l * 0.95) & (vwap <= h * 1.05))
+    return df[~bad]
+
+
+def rebuild_cleaned_year(year):
+    """重建清洗层某一年（从 frozen/daily_raw 派生）"""
+    src = FROZEN / "daily_raw" / f"year={year}"
+    dst = DB / "daily" / f"year={year}"
+    if not src.exists():
+        return
+    os.makedirs(dst, exist_ok=True)
+    files = sorted(src.glob("*.parquet"))
+    removed = 0
+    for f in files:
+        df = pd.read_parquet(f)
+        clean = clean_file(df)
+        removed += len(df) - len(clean)
+        if not clean.empty:
+            clean.to_parquet(dst / f.name, index=False)
+    print(f"  清洗层 {year}: {len(files)} 文件, 清理 {removed} 行", flush=True)
+
+
+def backup_daily():
+    """重建前备份清洗层（用于校验失败时回滚）"""
+    import shutil
+    if not (DB / "daily").exists():
+        return None
+    tmp = DB / ".daily_backup"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    shutil.copytree(DB / "daily", tmp)
+    return tmp
+
+
+def rollback_daily(backup):
+    """校验失败：恢复清洗层到更新前状态"""
+    import shutil
+    if backup is None:
+        return
+    if (DB / "daily").exists():
+        shutil.rmtree(DB / "daily")
+    shutil.move(str(backup), str(DB / "daily"))
+    print("已回滚：清洗层恢复为更新前状态")
+
+
+def run_validation():
+    """更新后自动执行数据校验（validate_data + clean_data 核心检查）
+
+    返回: (ok, 问题列表)。ok=False 时由调用方回滚。
+    """
+    import duckdb
+    problems = []
+    con = duckdb.connect()
+
+    # 1) 逻辑一致性：OHLC/非负/三角（清洗层全查）
+    try:
+        r = con.execute("""
+            WITH t AS (
+                SELECT open, high, low, close, volume, amount,
+                       amount / NULLIF(volume, 0) AS vwap
+                FROM read_parquet('db/daily/year=*/*.parquet')
+            )
+            SELECT
+                sum(CASE WHEN close <= 0 THEN 1 ELSE 0 END),
+                sum(CASE WHEN NOT (high>=low AND low<=open AND open<=high
+                                   AND low<=close AND close<=high) THEN 1 ELSE 0 END),
+                sum(CASE WHEN volume=0 OR volume IS NULL THEN 1 ELSE 0 END),
+                sum(CASE WHEN vwap IS NOT NULL AND volume>0
+                         AND NOT (vwap >= low*0.95 AND vwap <= high*1.05) THEN 1 ELSE 0 END)
+            FROM t
+        """).fetchone()
+        if r[0] or r[1] or r[2] or r[3]:
+            problems.append(f"逻辑校验: 价<=0:{r[0]}, OHLC违规:{r[1]}, 幽灵K线:{r[2]}, 三角违规:{r[3]}")
+    except Exception as e:
+        problems.append(f"逻辑校验失败: {e}")
+
+    # 2) 主键唯一性（code+trade_date）
+    try:
+        dup = con.execute("""
+            SELECT count(*) FROM (
+                SELECT code, trade_date, count(*) c
+                FROM read_parquet('db/daily/year=*/*.parquet')
+                GROUP BY code, trade_date HAVING count(*) > 1
+            )
+        """).fetchone()[0]
+        if dup:
+            problems.append(f"主键重复: {dup} 组")
+    except Exception as e:
+        problems.append(f"唯一性校验失败: {e}")
+
+    # 3) 数据新鲜度：清洗层最新日期不应滞后太多
+    try:
+        latest = con.execute("""
+            SELECT max(trade_date) FROM read_parquet('db/daily/year=*/*.parquet')
+        """).fetchone()[0]
+        gap = (datetime.date.today() - latest.date()).days if latest else 999
+        if gap > 10:
+            problems.append(f"数据滞后: 清洗层最新 {latest.date()}，距今 {gap} 天")
+    except Exception:
+        pass
+
+    if problems:
+        print("[校验] 发现问题:", *problems, sep="\n  - ")
+        return False, problems
+    print("[校验] 全部通过：逻辑/唯一性/新鲜度正常")
+    return True, problems
+
+
+# ============ 重建涨跌停价（仅当年） ============
+def rebuild_limit_year(year):
+    """从清洗层日线计算涨跌停价（主板±10%，创业板/科创板±20%，北交所±30%）"""
+    src = DB / "daily" / f"year={year}"
+    dst = DB / "limit" / f"year={year}"
+    if not src.exists():
+        return
+    os.makedirs(dst, exist_ok=True)
+    for f in sorted(src.glob("*.parquet")):
+        code = f.stem
+        df = pd.read_parquet(f)
+        df = df.sort_values("trade_date").copy()
+        df["pre_close"] = df["close"].shift(1)
+        if code.startswith(("300", "301", "688", "689")):
+            pct = 0.20
+        elif code.startswith("920"):
+            pct = 0.30
+        else:
+            pct = 0.10
+        df["limit_up"] = round(df["pre_close"] * (1 + pct), 2)
+        df["limit_down"] = round(df["pre_close"] * (1 - pct), 2)
+        out = df[["code", "trade_date", "pre_close", "limit_up", "limit_down"]].dropna()
+        out.to_parquet(dst / f"{code}.parquet", index=False)
+    print(f"  涨跌停价 {year}: {len(list(src.glob('*.parquet')))} 文件", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="每日数据更新")
+    parser.add_argument("--date", default="", help="更新到该日(默认今天, YYYY-MM-DD)")
+    parser.add_argument("--days", type=int, default=15, help="回看天数(默认15)")
+    parser.add_argument("--only", choices=["daily", "valuation", "adjust"], default="all")
+    parser.add_argument("--no-verify", action="store_true", help="跳过更新后自动校验")
+    args = parser.parse_args()
+
+    token = load_token()
+    if not token:
+        print("错误: 未找到 Tushare token")
+        return
+    ts.set_token(token)
+    pro = ts.pro_api()
+
+    end_date = args.date.replace("-", "") if args.date else datetime.date.today().strftime("%Y%m%d")
+    start = (datetime.date.today() - datetime.timedelta(days=args.days)).strftime("%Y%m%d")
+
+    try:
+        check_disk()
+    except RuntimeError as e:
+        print(e)
+        return
+
+    codes = live_codes()
+    print(f"更新区间: {start} ~ {end_date}, 股票 {len(codes)} 只")
+
+    # 更新前备份清洗层（用于校验失败回滚）
+    backup = backup_daily()
+    print("已备份清洗层（校验失败将自动回滚）")
+
+    if args.only in ("daily", "all"):
+        update_daily_raw(pro, codes, start, end_date)
+    if args.only in ("valuation", "all"):
+        update_valuation(pro, codes, start, end_date)
+    if args.only in ("adjust", "all"):
+        update_adjust(pro, codes, start, end_date)
+
+    # 重建清洗层 + 涨跌停价（当年）
+    year = int(end_date[:4])
+    print(f"\n重建清洗层/涨跌停价 (year={year})")
+    rebuild_cleaned_year(year)
+    rebuild_limit_year(year)
+
+    # 自动校验：不通过则回滚
+    if not args.no_verify:
+        print("\n=== 更新后自动校验 ===")
+        ok, problems = run_validation()
+        if not ok:
+            print("校验未通过，执行回滚...")
+            rollback_daily(backup)
+            print("已回滚。请检查数据源问题后重试。")
+            return
+        # 校验通过后删除备份
+        import shutil
+        if backup and backup.exists():
+            shutil.rmtree(backup)
+    else:
+        print("(已跳过校验)")
+
+    print("\n每日更新完成")
+
+
+if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    main()

@@ -1,0 +1,83 @@
+当前工程代码功能结构：
+
+数据层
+database/               — 数据基础设施（Parquet + DuckDB + frozen分层）
+
+文件	                         功能
+————————————————————————————————
+config.py	         路径映射：frozen层17个数据集 + 清洗层 + 磁盘阈值
+storage.py	         Parquet 按年/代码分区存储 + 断点记录
+loader.py	         统一读取入口：load_daily(前复权/原始)、load_valuation、load_factor、load_suspend、mark_suspended、fill_factor_nan、industry_median_factor
+query.py	         DuckDB 跨库 SQL 查询
+provenance.py	 清洗层时间戳/溯源 + 数据可获得日期
+token.py	         tushare token 加载
+downloader/	         10个数据下载器：calendar/stocks/daily/adjust/valuation/financial/indices/meta/other + 基类 + tushare客户端
+————————————————————————————————
+
+data/                        — 回测数据适配层
+
+文件	                         功能
+————————————————————————————————
+dataset.py	         DataSet 容器 + from_db()（数据库加载）+ load()（远程源）
+preprocessor.py	11个技术指标 + 注册表 + add_technical_indicators
+source.py	         DataSource 抽象：Local/Remote(akshare/baostock)/Mock
+————————————————————————————————
+
+
+策略层
+strategy/
+
+文件	                              策略
+————————————————————————————————
+base.py	                     Strategy 基类 + Signal/Action
+examples.py	             双均线、均值回归
+classic.py	             海龟、布林带、MACD、量过滤双均线
+modern.py	            DualThrust、网格、RSI背离、突破回踩、自适应均线
+————————————————————————————————
+
+回测层
+backtest/
+
+文件                     	    功能
+————————————————————————————————
+engine.py	           逐bar回测引擎（滑点+佣金+最低佣金+风控集成）
+metrics.py	          14项绩效指标（收益/夏普/卡尔玛/回撤族/Sortino系）
+lookahead.py	  未来因子检测：PIT校验、逐决策断言、6种检测方法文档
+————————————————————————————————
+
+执行/风控/组合/分析
+
+文件                 	                功能
+————————————————————————————————
+execution/order.py	        订单模型 + 状态机
+execution/broker.py	        模拟券商（万1佣金+最低5元+平方根滑点）
+portfolio/portfolio.py	        持仓/现金/PnL/历史峰值回撤
+risk/manager.py	               风控规则链（回撤限/仓位限）
+analytics/visualizer.py	       净值/回撤/分布图
+————————————————————————————————
+
+脚本（scripts/）
+文件	                                      功能
+————————————————————————————————
+backtest.py	                                回测CLI（单策略/对比/JSON/可视化）
+backtest_demo.py	                6个教学案例
+semiconductor_rotation.py	半导体低PE轮动策略（含基准+完整指标+未来因子断言）
+download_tushare_raw.py	        全市场不复权原始价 → frozen
+download_frozen_tushare.py	adjust/st/valuation/etf/options 原始数据
+daily_update.py	                        每日收盘后增量更新 + 重建清洗层
+rebuild_cleaned.py	                清洗层重建（+时间戳）
+validate_data.py	                        唯一性/Schema/覆盖率校验
+clean_data.py	                        OHLC/非负/三角/因子跳变校验
+run_download.py	                        全量下载调度
+_tushare_common.py	                共享限流/重试/代码转换
+————————————————————————————————
+
+其他
+文件                                	              功能
+————————————————————————————————
+main.py	                                    入口（委托 scripts/backtest）
+config/settings.py	           全局参数（万1佣金/最低5元）
+utils/	                                   日志 + help_all指标帮助 + 工具函数
+data_statistics/stats.py	   单股/多股月度统计
+docs/数据字段说明.md	           16个数据集字段+读取案例
+————————————————————————————————
