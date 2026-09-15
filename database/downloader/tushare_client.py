@@ -25,8 +25,10 @@ class TushareClient:
             if not token:
                 raise RuntimeError("未找到 Tushare token，请设置环境变量或 database/tushare_token.txt")
             import tushare as ts
-            ts.set_token(token)
-            self._pro = ts.pro_api()
+            # ⚠️ 不要用 ts.set_token(token)：它会把 token 写进 C:\Users\<user>\tk.csv，
+            # 在没有家目录写权限的环境（受限沙箱 / 服务账号）会直接 PermissionError，
+            # 整个下载流程起不来。pro_api 支持直接传 token，语义完全一样。
+            self._pro = ts.pro_api(token)
         return self._pro
 
     def _wait(self):

@@ -69,6 +69,7 @@ FROZEN_DATASETS = {
     "industry":    "tushare 行业分类（申万）",
     "index_cons":  "tushare 指数成分及权重",
     "index_daily": "tushare 指数日K",
+    "fund_daily":  "tushare 基金/ETF 日K（与 etf 的月度快照分开存，避免粒度混用）",
     "etf":         "tushare 基金列表（fund_basic）",
     "futures":     "tushare 期货主连",
     "options":     "tushare 期权合约",
