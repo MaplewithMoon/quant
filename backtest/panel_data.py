@@ -39,9 +39,13 @@ def load_status_panels(start: str, end: str, codes=None) -> dict:
     2. `suspend.trade_date` 是 **VARCHAR 'YYYYMMDD'**，不是 DATE。
        与 Timestamp 参数比较本身就是错的。
 
-    现在：分区路径一律走 `database.config.year_globs()`（只看真实存在的分区），
-    日期显式 strptime 转换，只取 `suspend_type='S'`（'R' 是复牌日，当天可交易），
-    并且**数据集存在却读不出来时直接抛错**，绝不静默降级。
+    现在：
+      - `cleaned/limit_price` 的分区路径走 `database.config.year_globs()`
+        （只列真实存在的分区，不再按区间硬拼）
+      - 停牌走**唯一实现** `database.status.load_suspensions()` ——
+        它只取 `suspend_type='S'`（`'R'` 是复牌日，当天可交易），
+        并把 VARCHAR 'YYYYMMDD' 显式转成日期
+      - 数据集存在却读不出来时**打印醒目警告**，绝不静默返回空表
     """
     from database.config import connect_duckdb, year_globs
 
