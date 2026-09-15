@@ -525,8 +525,16 @@ def get_security_info(code):
 
 
 def get_trade_days(start_date=None, end_date=None, count=None):
+    """交易日列表
+
+    ⚠️ 返回 **datetime.date 列表**，不是 DatetimeIndex。
+    策略里写的是 `g.trading_day = get_trade_days(...)[0]` 然后
+    `today == g.trading_day`（today 是 `context.current_dt.date()`，即 datetime.date）。
+    pandas 的 `Timestamp == datetime.date` **恒为 False**，所以返回 Timestamp 会让
+    策略的"到调仓日了吗"永远不成立 —— v2 因此整段回测一次都没调仓、全程持 ETF。
+    """
     d = _d().trade_days(start=start_date, end=end_date, count=count)
-    return pd.DatetimeIndex(d)
+    return [x.date() if hasattr(x, "date") else x for x in pd.DatetimeIndex(d)]
 
 
 def get_all_securities(types=None, date=None):
@@ -841,6 +849,14 @@ class JQEngine:
     # ---------- 事件循环 ----------
     def run(self, initialize, dates=None, progress=None) -> dict:
         dates = pd.DatetimeIndex(dates if dates is not None else self.data.dates)
+        # ⚠️ initialize 里读到的 current_dt / previous_date 必须是**回测起始日**，
+        # 不是面板首日。面板为了预热会多带一年多的历史，若拿面板首日，
+        # 策略在 initialize 里算出来的日子（如 v2 的 g.trading_day）会落在预热期，
+        # 之后 `today == g.trading_day` 永远不成立 -> 整个回测一次都不调仓。
+        self.current_date = dates[0]
+        self.current_dt = datetime.datetime.combine(dates[0].date(),
+                                                    datetime.time(9, 30))
+        self.previous_date = dates[0].date()
         self.context = Context(self)
         initialize(self.context)
         self._rebuild_broker()
