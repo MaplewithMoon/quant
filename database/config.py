@@ -158,12 +158,18 @@ def parquet_glob(path) -> str:
     """生成 DuckDB read_parquet() 用的 glob，统一走正斜杠
 
     例：parquet_glob(dir_of("daily")) -> 'D:/quant/db/cleaned/daily_basic/year=*/*.parquet'
+
+    若传入的路径**已经**是某个年份分区（含 `year=`），则只补 `*.parquet`——
+    否则会拼出 `year=2025/year=*/*.parquet` 这种不存在的路径，DuckDB 直接抛
+    `IOException: No files found that match the pattern`。
     """
     p = Path(path)
     if p.is_absolute():
         base = p
     else:
         base = PROJECT_ROOT / p
+    if any(part.startswith("year=") for part in base.parts):
+        return (base / "*.parquet").as_posix()
     return (base / "year=*" / "*.parquet").as_posix()
 
 

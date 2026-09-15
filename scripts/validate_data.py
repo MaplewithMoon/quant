@@ -167,7 +167,7 @@ def check_coverage(quick=True, sample_days=10, sample_stocks=30):
     sample_years = years[-2:]  # 最近两年
     date_counts = {}
     for y in sample_years:
-        yg = parquet_glob(DAILY_DIR / f"year={y}")
+        yg = (DAILY_DIR / f"year={y}" / "*.parquet").as_posix()
         df = con.execute(f"""
             SELECT trade_date, count(DISTINCT code) AS n
             FROM read_parquet('{yg}')

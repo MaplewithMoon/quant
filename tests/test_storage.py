@@ -250,6 +250,29 @@ def test_frozen_guard_still_works():
     print("[OK] frozen 只读保护仍生效；下载器路径 allow_frozen=True 可写")
 
 
+def test_parquet_glob_handles_year_partition():
+    """回归：parquet_glob 传入"年份分区目录"时不能拼出双 year=
+
+    早期实现无条件追加 `year=*/*.parquet`，于是
+    `parquet_glob(root/"daily_basic"/"year=2025")` 会得到
+    `.../year=2025/year=*/*.parquet`（不存在），DuckDB 直接抛
+    `IOException: No files found that match the pattern`——
+    `scripts/validate_data.py --quick` 的覆盖率检查就是这么崩的。
+    """
+    from database.config import parquet_glob, CLEANED_ROOT
+    root_g = parquet_glob(CLEANED_ROOT / "daily_basic")
+    assert root_g.endswith("/year=*/*.parquet"), root_g
+    assert "year=*/year=*" not in root_g
+
+    y_g = parquet_glob(CLEANED_ROOT / "daily_basic" / "year=2025")
+    assert y_g.endswith("/year=2025/*.parquet"), y_g
+    assert y_g.count("year=") == 1, f"不应出现重复 year= 分区: {y_g}"
+
+    # 传字符串路径也要一致
+    assert parquet_glob(str(CLEANED_ROOT / "daily_basic" / "year=2025")) == y_g
+    print(f"[OK] parquet_glob 年份分区正确: {y_g}")
+
+
 if __name__ == "__main__":
     test_save_is_atomic_on_failure()
     test_save_writes_via_replace()
@@ -261,4 +284,5 @@ if __name__ == "__main__":
     test_tushare_client_returns_empty_not_none()
     test_tushare_rate_limit_on_every_retry()
     test_frozen_guard_still_works()
+    test_parquet_glob_handles_year_partition()
     print("\n全部数据层可靠性测试通过")
