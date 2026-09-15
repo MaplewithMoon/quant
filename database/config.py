@@ -173,6 +173,30 @@ def parquet_glob(path) -> str:
     return (base / "year=*" / "*.parquet").as_posix()
 
 
+def connect_duckdb(db_path=None, threads: int = 4, **kwargs):
+    """统一的 DuckDB 连接工厂
+
+    存在的意义：`SET enable_progress_bar=false` 漏在任何一个连接上，扫描
+    parquet 时就会往 stderr 刷进度条，把日志/CI 输出冲得没法看。与其在每个
+    `duckdb.connect()` 后面记得补一句，不如只留这一个入口。
+
+    参数:
+        db_path: None = 内存库（只读查询用）；否则打开/创建该文件
+        threads: 扫描线程数
+    """
+    import duckdb
+
+    con = duckdb.connect(str(db_path)) if db_path else duckdb.connect()
+    try:
+        con.execute(f"PRAGMA threads={int(threads)}")
+    except Exception:
+        pass
+    con.execute("SET enable_progress_bar=false")
+    for k, v in kwargs.items():
+        con.execute(f"SET {k}={v}")
+    return con
+
+
 def setup_database():
     """创建数据库目录结构"""
     DB_ROOT.mkdir(parents=True, exist_ok=True)

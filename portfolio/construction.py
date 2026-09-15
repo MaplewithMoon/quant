@@ -189,3 +189,47 @@ def turnover_of_weights(target: pd.DataFrame) -> pd.Series:
         return pd.Series(dtype=float)
     diff = reb.fillna(0).diff().abs().sum(axis=1) / 2
     return diff.iloc[1:]
+
+
+def equal_weight_returns(panel: dict, mask: pd.DataFrame,
+                         rebalance="M", price_key: str = "close_adj") -> pd.Series:
+    """等权基准的日收益序列（解析解，不跑撮合引擎）
+
+    逻辑：每期期初在股票池内等权买入，期内**买入持有**（权重自然漂移），
+    到下一调仓日重新等权。
+
+    为什么不用 `PortfolioBacktestEngine` 跑：
+        股票池有 2000+ 只票时，引擎要逐日对每个持仓盯市，实测一次 20 分钟以上。
+        而这个基准的用途只是回答"策略是不是只赚了市场 beta"，解析计算几秒就够，
+        口径也更清楚（毛收益，不含费用；作为对照组足够，且不受整手约束扭曲）。
+
+    返回: index=交易日, values=日收益（第一期期初为 0）
+    """
+    price = panel.get(price_key)
+    if price is None:
+        price = panel["close"]
+    ret = price.astype(float).pct_change(fill_method=None)
+    dates = ret.index
+    if len(dates) < 2:
+        return pd.Series(dtype=float)
+
+    m = mask.reindex(index=dates, columns=ret.columns).fillna(False).astype(bool)
+    reb = list(rebalance_dates(dates, rebalance))
+    if not reb:
+        return pd.Series(0.0, index=dates)
+
+    out = pd.Series(np.nan, index=dates, dtype=float)
+    for i, t0 in enumerate(reb):
+        t1 = reb[i + 1] if i + 1 < len(reb) else None
+        picked = m.loc[t0]
+        cols = picked.index[picked.to_numpy()]
+        if len(cols) == 0:
+            continue
+        seg = ret.loc[dates > t0] if t1 is None else ret.loc[(dates > t0) & (dates < t1)]
+        if seg.empty:
+            continue
+        w = pd.Series(1.0 / len(cols), index=cols)
+        cum = (1.0 + seg[cols].fillna(0.0)).cumprod()
+        nav = (cum * w).sum(axis=1)                 # 期初净值 = 1.0
+        out.loc[nav.index] = (nav / nav.shift(1).fillna(1.0) - 1.0).to_numpy()
+    return out.fillna(0.0)

@@ -58,10 +58,9 @@ class UniverseSpec:
 # ============================================================
 def load_index_members(index_code: str = "000300.SH") -> pd.DataFrame:
     """读取指数成分的历史快照（长表：trade_date, code, weight）"""
-    import duckdb
+    from database.config import connect_duckdb
     glob = f"{FROZEN_ROOT.as_posix()}/index_cons/year=*/*.parquet"
-    con = duckdb.connect()
-    con.execute("SET enable_progress_bar=false")
+    con = connect_duckdb()
     try:
         df = con.execute(f"""
             SELECT CAST(trade_date AS VARCHAR) AS trade_date, con_code, weight
@@ -139,9 +138,9 @@ def st_panel(dates: pd.DatetimeIndex, codes) -> pd.DataFrame:
     数据来源 frozen/st（tushare namechange），每条记录给出一个名称生效区间
     [start_date, end_date]；名称含 ST 的区间即为风险警示期。
     """
-    import duckdb
+    from database.config import connect_duckdb
     glob = f"{FROZEN_ROOT.as_posix()}/st/year=*/*.parquet"
-    con = duckdb.connect()
+    con = connect_duckdb()
     try:
         df = con.execute(f"""
             SELECT code, name, start_date, end_date
@@ -174,9 +173,9 @@ def st_panel(dates: pd.DatetimeIndex, codes) -> pd.DataFrame:
 
 def suspended_panel(dates: pd.DatetimeIndex, codes) -> pd.DataFrame:
     """停牌掩码（宽表 bool）"""
-    import duckdb
+    from database.config import connect_duckdb
     glob = f"{FROZEN_ROOT.as_posix()}/suspend/year=*/*.parquet"
-    con = duckdb.connect()
+    con = connect_duckdb()
     try:
         df = con.execute(f"""
             SELECT code, trade_date FROM read_parquet('{glob}')

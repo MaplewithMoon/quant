@@ -21,6 +21,8 @@ TESTS = [
     "tests/test_universe.py",
     "tests/test_portfolio_backtest.py",
     "tests/test_attribution.py",
+    "tests/test_performance.py",
+    "tests/test_sector_rotation.py",
 ]
 
 

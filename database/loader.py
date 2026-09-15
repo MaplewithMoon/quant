@@ -260,9 +260,85 @@ def industry_median_factor(factor_col: str, date: str, industry_col: str = "indu
 
 
 def load_industry_map() -> pd.DataFrame:
-    """读取股票-行业归属映射（frozen 层）"""
-    files = list((DB / "frozen" / "industry").glob("year=*/*.parquet"))
+    """读取股票-行业归属映射（frozen 层 stock_industry）
+
+    ⚠️ 只读 `stock_industry.parquet`。`frozen/industry/` 下还躺着 `sw_l1.parquet`
+    （申万一级行业清单），两者 schema 完全不同；用 `year=*/*.parquet` 一把捞会得到
+    两张表的列并集，全是 NaN —— DuckDB 遇到这种 glob 会直接抛
+    `schema mismatch in glob`。
+    """
+    files = sorted((DB / "frozen" / "industry").glob("year=*/*.parquet"))
+    files = [f for f in files if f.name == "stock_industry.parquet"]
     if not files:
         return pd.DataFrame()
     dfs = [pd.read_parquet(f) for f in files]
     return pd.concat(dfs, ignore_index=True)
+
+
+def load_sw_l1() -> pd.DataFrame:
+    """读取申万一级行业清单（frozen 层 sw_l1，31 个行业）
+
+    返回列: index_code（如 801010.SI）/ industry_name / industry_code
+    注意：库里**没有**这些行业指数的行情，只有清单。
+    """
+    files = sorted((DB / "frozen" / "industry").glob("year=*/*.parquet"))
+    files = [f for f in files if f.name == "sw_l1.parquet"]
+    if not files:
+        return pd.DataFrame()
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    return df.drop_duplicates("index_code").reset_index(drop=True)
+
+
+# ============================================================
+# 指数行情（frozen/index_daily）
+# ============================================================
+INDEX_DAILY = DB / "frozen" / "index_daily"
+
+# 库里实际有行情的指数（宽基）。申万行业指数只有清单、没有行情。
+AVAILABLE_INDEXES = {
+    "000300.SH": "沪深300",
+    "000905.SH": "中证500",
+    "000852.SH": "中证1000",
+    "932000.CSI": "中证2000",
+}
+
+
+def load_index_daily(code: str, start: str = None, end: str = None) -> pd.DataFrame:
+    """读取指数日行情（frozen/index_daily）
+
+    返回列: trade_date / open / high / low / close / pre_close / pct_chg / vol / amount
+    这是**真实指数点位**，可直接作为基准；不要拿"成分股加权"去近似。
+    """
+    files = sorted(INDEX_DAILY.glob("year=*/*.parquet"))
+    if not files:
+        return pd.DataFrame()
+    dfs = []
+    for f in files:
+        try:
+            d = pd.read_parquet(f, columns=["ts_code", "trade_date", "open", "high",
+                                            "low", "close", "pre_close", "pct_chg",
+                                            "vol", "amount"])
+        except Exception:
+            d = pd.read_parquet(f)
+        d = d[d["ts_code"] == code]
+        if not d.empty:
+            dfs.append(d)
+    if not dfs:
+        return pd.DataFrame()
+    df = pd.concat(dfs, ignore_index=True)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df = df.sort_values("trade_date").drop_duplicates("trade_date")
+    if start:
+        df = df[df["trade_date"] >= pd.to_datetime(start)]
+    if end:
+        df = df[df["trade_date"] <= pd.to_datetime(end)]
+    return df.reset_index(drop=True)
+
+
+def load_index_close(code: str, start: str = None, end: str = None) -> pd.Series:
+    """指数收盘价序列（index=交易日），基准对齐最常用"""
+    df = load_index_daily(code, start, end)
+    if df.empty:
+        return pd.Series(dtype=float)
+    return df.set_index("trade_date")["close"].astype(float)
+

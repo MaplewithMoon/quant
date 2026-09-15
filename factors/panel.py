@@ -50,13 +50,11 @@ def load_panel(start: str, end: str, codes: list = None,
             close_adj / high_adj / low_adj / open_adj     （adjust=True 时）
             total_mv / circ_mv / pe_ttm / pb / turnover_rate （with_valuation 时）
     """
-    import duckdb
+    from database.config import connect_duckdb
 
     y0, y1 = pd.Timestamp(start).year, pd.Timestamp(end).year
     daily_glob = _glob(dir_of("daily"), y0, y1)
-    con = duckdb.connect()
-    con.execute("PRAGMA threads=4")
-    con.execute("SET enable_progress_bar=false")   # 关掉扫描进度条，避免刷屏
+    con = connect_duckdb()
 
     where = ["trade_date >= ?", "trade_date <= ?"]
     params = [pd.Timestamp(start), pd.Timestamp(end)]

@@ -23,7 +23,9 @@
 - 业绩归因对比基准为该指数的权重（同样取历史快照）。
 """
 import sys, io, os, argparse
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+# 逐行刷新，否则重定向到日志时要等缓冲区满才可见（会覆盖 python -u 的效果）
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
+                              line_buffering=True, write_through=True)
 sys.path.insert(0, ".")
 
 import numpy as np

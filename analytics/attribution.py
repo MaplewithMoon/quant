@@ -41,6 +41,26 @@ def load_industry_map() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+UNKNOWN_INDUSTRY = "未分类"
+
+
+def _industry_series(industry_map: pd.DataFrame, columns=None) -> pd.Series:
+    """code -> 行业；**缺失的一律落到"未分类"而不是 NaN**
+
+    ⚠️ 为什么不能留 NaN：`groupby` 会直接丢掉 NaN 分组，
+    于是这些股票的权重和收益在整个拆解里凭空消失，
+    Brinson 恒等式 Σ(配置+选股+交互) = r_p − r_b 立刻不成立
+    —— 实测全市场组合（持有大量已退市/非当前行业表的股票）时，
+    总计只有 −131%，而真实超额是 −108%，差的就是这块被吞掉的权重。
+
+    `industry_map` 是**当前**快照，退市股天然不在里面，所以这不是边角情况。
+    """
+    m = industry_map.set_index("code")["industry"]
+    if columns is not None:
+        m = m.reindex(list(columns))
+    return m.fillna(UNKNOWN_INDUSTRY)
+
+
 def industry_exposure(holdings: pd.DataFrame,
                       industry_map: pd.DataFrame) -> pd.DataFrame:
     """逐日行业权重暴露（index=日期, columns=行业）
@@ -49,8 +69,7 @@ def industry_exposure(holdings: pd.DataFrame,
     """
     if holdings.empty or industry_map.empty:
         return pd.DataFrame()
-    m = industry_map.set_index("code")["industry"]
-    ind = m.reindex(holdings.columns)
+    ind = _industry_series(industry_map, holdings.columns)
     out = {}
     for d, row in holdings.iterrows():
         r = row.dropna()
@@ -96,10 +115,16 @@ def multi_factor_exposure(holdings: pd.DataFrame,
 # ============================================================
 def _industry_returns(weights: pd.Series, asset_ret: pd.Series,
                       ind: pd.Series) -> pd.Series:
-    """给定权重与个股收益，算各行业收益（行业内部按权重加权）"""
-    r = asset_ret.reindex(weights.index)
-    g = ind.reindex(weights.index)
-    df = pd.DataFrame({"w": weights, "r": r, "ind": g}).dropna()
+    """给定权重与个股收益，算各行业收益（行业内部按权重加权）
+
+    ⚠️ 这里**不能用 dropna()** 过滤。调用方算组合/基准总收益时用的是
+    `(w * r).fillna(0)`，也就是"缺收益按 0 计"；如果这里把缺数据的股票整行丢掉，
+    行业收益的分母就变小，`Σ w_i · r_i ≠ 总收益`，Brinson 恒等式立刻不成立
+    （实测真实持仓下逐期残差达 1.6e-2）。两边必须用同一套缺失值口径。
+    """
+    r = asset_ret.reindex(weights.index).fillna(0.0)
+    g = ind.reindex(weights.index).fillna(UNKNOWN_INDUSTRY)
+    df = pd.DataFrame({"w": weights.astype(float), "r": r, "ind": g})
     if df.empty:
         return pd.Series(dtype=float)
     grp = df.groupby("ind")
@@ -126,7 +151,13 @@ def brinson(holdings: pd.DataFrame, benchmark_weights: pd.DataFrame,
     """
     if holdings.empty or benchmark_weights.empty or industry_map.empty:
         return pd.DataFrame()
-    ind = industry_map.set_index("code")["industry"]
+    # ⚠️ 行业映射必须覆盖**组合与基准的并集**列空间。
+    # `MultiBacktestResult.holdings` 只包含"实际持有过"的代码（几百只），
+    # 而基准有 300 只成分股。若只用 holdings.columns 建映射，基准里那些不在
+    # 组合持仓中的股票行业就是 NaN，会被丢掉 → 基准侧 Σw < 1 → 恒等式破裂
+    # （实测逐期残差 1.6e-2）。
+    ind = _industry_series(industry_map,
+                           holdings.columns.union(benchmark_weights.columns))
 
     # 归因区间：取权重发生变化的日期 + 最后一天
     if rebalance_dates is None:
@@ -141,6 +172,9 @@ def brinson(holdings: pd.DataFrame, benchmark_weights: pd.DataFrame,
         rebalance_dates.append(holdings.index[-1])
 
     rows = []
+    sum_excess = 0.0                 # Σ 各期 (r_p − r_b)：分解结果的正确对照物
+    n_periods = 0
+    max_gap = 0.0                    # 逐期 |Σ效应 − (r_p − r_b)| 的最大值，应≈0
     for t0, t1 in zip(rebalance_dates, rebalance_dates[1:]):
         seg = returns.loc[(returns.index > t0) & (returns.index <= t1)]
         if seg.empty:
@@ -155,12 +189,15 @@ def brinson(holdings: pd.DataFrame, benchmark_weights: pd.DataFrame,
 
         rp = float((wp * asset_ret.reindex(wp.index).fillna(0)).sum())
         rb = float((wb * asset_ret.reindex(wb.index).fillna(0)).sum())
+        sum_excess += rp - rb
+        n_periods += 1
         rp_i = _industry_returns(wp, asset_ret, ind)
         rb_i = _industry_returns(wb, asset_ret, ind)
 
         wp_i = wp.groupby(ind.reindex(wp.index)).sum()
         wb_i = wb.groupby(ind.reindex(wb.index)).sum()
         inds = wp_i.index.union(wb_i.index)
+        per_effect = 0.0
         for i in inds:
             wpi = float(wp_i.get(i, 0.0))
             wbi = float(wb_i.get(i, 0.0))
@@ -169,11 +206,20 @@ def brinson(holdings: pd.DataFrame, benchmark_weights: pd.DataFrame,
             alloc = (wpi - wbi) * (rbi - rb)
             select = wbi * (rpi - rbi)
             inter = (wpi - wbi) * (rpi - rbi)
+            per_effect += alloc + select + inter
             rows.append({"行业": i, "配置效应": alloc, "选股效应": select,
                          "交互效应": inter})
+        max_gap = max(max_gap, abs(per_effect - (rp - rb)))
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).groupby("行业", as_index=True).sum()
     df["合计"] = df.sum(axis=1)
     total = df.sum().rename("总计")
-    return pd.concat([df.sort_values("合计", ascending=False), total.to_frame().T])
+    out = pd.concat([df.sort_values("合计", ascending=False), total.to_frame().T])
+    # 把对账口径挂在 attrs 上：分解之和应当等于各期 (r_p − r_b) 之和。
+    # ⚠️ 不要拿它去和"几何超额"（策略累计 − 基准累计）比 —— 那是复利口径，
+    # 波动越大差得越远；也别拿"日度算术超额"比，期数不同。
+    out.attrs["sum_excess"] = float(sum_excess)
+    out.attrs["n_periods"] = int(n_periods)
+    out.attrs["max_period_gap"] = float(max_gap)
+    return out
