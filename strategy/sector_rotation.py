@@ -46,12 +46,22 @@ class SectorRotationSpec:
     vol_adjust: bool = True       # 动量 / 板块波动率（风险调整动量）
     min_sectors: int = 30         # 当日有效板块数少于此值则空仓（数据不健康时保护）
     min_stocks_per_sector: int = 5   # 板块内有效股票数下限，低于此值该板块不可选
-    secondary: str = "amount"     # 板块内选股的次级因子: amount / low_vol / none
+    secondary: str = "amount"     # 板块内选股：amount / low_vol / large_cap / neutral_cap / none
     secondary_window: int = 20    # 次级因子回看窗口
     direction: str = "momentum"   # momentum=买最强板块 / reversal=买最弱板块
     sector_weighting: str = "equal"   # equal / momentum
     max_weight: float = 0.0       # 单票权重上限
     rebalance: str = "M"          # D / W / M / 整数
+
+    # ---- 改进 1：风险控制（绝对动量 + 市场趋势过滤） ----
+    # 原版策略永远满仓、永远持有最热的 K 个板块，这是 −77% 回撤的直接来源。
+    abs_threshold: float = None   # 打分高于该门槛的板块才可入选；None=不过滤
+                                  # momentum 方向下设 0 即"只买上涨的板块"
+    scaled_exposure: bool = False # True=按合格板块数线性降仓
+                                  # （只选出 2/5 个板块 -> 仓位 40%，其余持币）
+    min_exposure: float = 0.0     # 目标仓位下限（0=允许空仓）
+    market_ma: int = 0            # >0 启用市场趋势过滤：指数在 N 日均线上方才满仓
+    defensive_exposure: float = 0.0   # 趋势过滤判定为"风险期"时的目标仓位
 
     # ---- 非寻优字段（执行/口径） ----
     exclude_sectors: Tuple[str, ...] = ()   # 需要剔除的板块（如"综合"这类壳公司聚集地）
@@ -65,9 +75,15 @@ class SectorRotationSpec:
         if self.vol_adjust:
             parts.append("风险调整")
         if self.secondary != "none":
-            parts.append(f"次级因子={self.secondary}")
+            parts.append(f"选股={self.secondary}")
         if self.sector_weighting != "equal":
             parts.append(f"板块加权={self.sector_weighting}")
+        if self.abs_threshold is not None:
+            parts.append(f"绝对动量>{self.abs_threshold:g}")
+        if self.scaled_exposure:
+            parts.append("按合格数降仓")
+        if self.market_ma:
+            parts.append(f"趋势过滤{self.market_ma}日→防守仓{self.defensive_exposure:.0%}")
         return " / ".join(parts)
 
 
@@ -250,7 +266,15 @@ def select_sectors(momentum: pd.DataFrame, top_k: int,
 # ============================================================
 def _secondary_score(panel: dict, spec: SectorRotationSpec,
                      codes) -> pd.DataFrame:
-    """板块内选股用的次级因子（越大越优先）"""
+    """板块内选股用的次级因子（越大越优先）
+
+    amount       20 日均成交额（越大越优先）—— 流动性
+    low_vol      波动率（越低越优先）
+    large_cap    总市值（越大越优先）—— 把组合往大盘偏，压小盘 beta
+    neutral_cap  市值中性：在**板块内部**取市值最接近板块中位数的股票，
+                 不改变板块本身的市值暴露方向，只去掉"总是挑最小票"这个隐含赌注
+    none         不做区分（板块内等权全买）
+    """
     if spec.secondary == "none":
         return pd.DataFrame(1.0, index=panel["close"].index, columns=codes)
     w = max(int(spec.secondary_window), 1)
@@ -263,36 +287,90 @@ def _secondary_score(panel: dict, spec: SectorRotationSpec,
         vol = _returns(panel).reindex(columns=codes).rolling(
             w, min_periods=max(3, w // 3)).std(ddof=1)
         return -vol                       # 波动越低分越高
-    raise ValueError(f"未知次级因子 {spec.secondary!r}（amount/low_vol/none）")
+    if spec.secondary in ("large_cap", "neutral_cap"):
+        mv = panel.get("total_mv")
+        if mv is None:
+            raise KeyError(f"secondary={spec.secondary} 需要 total_mv 面板"
+                           "（load_price_panel 的 with_valuation=True）")
+        logmv = np.log(mv.reindex(columns=codes).where(lambda x: x > 0))
+        logmv = logmv.rolling(w, min_periods=max(3, w // 3)).mean()
+        if spec.secondary == "large_cap":
+            return logmv                  # 市值越大分越高
+        # 市值中性：按**当日板块内**偏离中位数的程度打分（越接近中位数越高）。
+        # 分位数标准化必须在板块内做，所以这里返回的是"可比较的原始分"，
+        # 真正的板块内中性化在下面 _neutralize_by_sector 里做。
+        return logmv
+    raise ValueError(f"未知次级因子 {spec.secondary!r}"
+                     "（amount/low_vol/large_cap/neutral_cap/none）")
+
+
+def _neutralize_by_sector(score: pd.Series,
+                          cols_by_sector: Dict[str, List[str]]) -> pd.Series:
+    """把某一天的次级因子按**板块内**分位标准化到 [0,1]
+
+    用于 neutral_cap：市值中性不是"买最大的"也不是"买最小的"，
+    而是"买最接近本板块中位数的"。在板块内做百分位排名正好实现这件事。
+    """
+    out = pd.Series(np.nan, index=score.index, dtype=float)
+    for sec, members in cols_by_sector.items():
+        sub = score.reindex(members).dropna()
+        if len(sub) < 2:
+            continue
+        r = sub.rank(pct=True)
+        out.loc[r.index] = 1.0 - (r - 0.5).abs() * 2.0    # 1=最接近中位数, 0=最极端
+    return out
 
 
 @dataclass
 class RotationPlan:
     """一次轮动决策的明细（用于报告与复盘）"""
-    weights: pd.DataFrame                       # 目标权重面板（非调仓日 NaN）
+    weights: pd.DataFrame                       # 目标权重面板（非调仓日 NaN，
+                                                # 全 0 行 = 明确清仓持币）
     selected_sectors: pd.DataFrame              # 调仓日选中的板块（date × sector, bool）
     momentum: pd.DataFrame                      # 板块**打分**（date × sector）
                                                 # ⚠️ direction="reversal" 时这里是取负后的
                                                 # 选股打分，不是原始动量
     holding_detail: pd.DataFrame = field(default_factory=pd.DataFrame)  # 调仓日持仓明细
     n_holdings: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    exposure: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    """调仓日的目标总仓位（1.0=满仓，0.0=空仓持币）。weights 的每行和就是它。"""
+
+
+def _market_ok(market_close: pd.Series, dates, ma_window: int) -> pd.Series:
+    """市场趋势过滤：指数收盘价是否在其 N 日均线之上（宽表口径：index=日期, bool）
+
+    返回 Series（index=dates, bool）。数据不足的位置按 True 处理（不误伤）。
+    """
+    if market_close is None or len(market_close) == 0 or ma_window <= 0:
+        return pd.Series(True, index=dates)
+    mc = pd.Series(market_close).astype(float).sort_index()
+    ma = mc.rolling(ma_window, min_periods=max(20, ma_window // 3)).mean()
+    ok = (mc > ma).reindex(dates)
+    return ok.fillna(True).astype(bool)
 
 
 def build_rotation_weights(panel: dict, mask: pd.DataFrame,
                            sector_map: pd.Series,
                            spec: SectorRotationSpec = None,
-                           sector_data: SectorData = None) -> RotationPlan:
+                           sector_data: SectorData = None,
+                           market_close: pd.Series = None) -> RotationPlan:
     """构造板块轮动的目标权重面板
 
     参数:
-        panel:       `backtest.panel_data.load_price_panel` 的产出
-        mask:        `universe.build_universe` 的产出（True=当日可选）
-        sector_map:  股票代码 -> 板块名
-        spec:        策略参数
-        sector_data: 预计算的板块数据（网格搜索时务必传入，否则每组参数都要重算）
+        panel:        `backtest.panel_data.load_price_panel` 的产出
+        mask:         `universe.build_universe` 的产出（True=当日可选）
+        sector_map:   股票代码 -> 板块名
+        spec:         策略参数
+        sector_data:  预计算的板块数据（网格搜索时务必传入，否则每组参数都要重算）
+        market_close: 市场指数收盘价（启用 market_ma 趋势过滤时需要）
 
     返回:
         RotationPlan（weights 可直接喂给 PortfolioBacktestEngine）
+
+    ⚠️ 现金仓位的表示：调仓日若目标仓位 < 100%，`weights` 那一行的**和就等于目标仓位**，
+    权重为 0 的股票显式写 0（而不是 NaN）。全 0 行代表"清仓持币"。
+    绝不能把"空仓"写成整行 NaN —— 引擎把 NaN 行理解为"今天不调仓"，
+    那样该卖的票根本卖不掉。
     """
     spec = spec or SectorRotationSpec()
     close = panel["close"]
@@ -316,17 +394,31 @@ def build_rotation_weights(panel: dict, mask: pd.DataFrame,
     elif spec.direction != "momentum":
         raise ValueError(f"未知方向 {spec.direction!r}（momentum/reversal）")
 
+    # 改进 1a：绝对动量门槛 —— 打分不够高的板块直接踢出候选池
+    if spec.abs_threshold is not None:
+        mom = mom.where(mom > spec.abs_threshold)
+
     sel = select_sectors(mom, spec.top_sectors, spec.min_sectors)
     sec_score = _secondary_score(panel, spec, codes)
     cols_by_sector = _sector_columns(sector_map, codes)
+    mkt_ok = _market_ok(market_close, dates, spec.market_ma)
 
     reb = rebalance_dates(dates, spec.rebalance)
     weights = pd.DataFrame(np.nan, index=dates, columns=codes)
+    exposure = pd.Series(np.nan, index=dates, dtype=float)
     detail_rows = []
 
     for d in reb:
         chosen = [s for s in mom.columns if bool(sel.at[d, s])] if d in sel.index else []
+
+        # 改进 3：neutral_cap 需要按**当日板块内**分位重新打分
+        if spec.secondary == "neutral_cap" and d in sec_score.index:
+            sc_today = _neutralize_by_sector(sec_score.loc[d], cols_by_sector)
+        else:
+            sc_today = sec_score.loc[d] if d in sec_score.index else pd.Series(dtype=float)
+
         picks: List[str] = []
+        kept_sectors: List[str] = []
         for sec in chosen:
             members = cols_by_sector.get(sec, [])
             if not members:
@@ -336,59 +428,80 @@ def build_rotation_weights(panel: dict, mask: pd.DataFrame,
             if len(cand) < spec.min_stocks_per_sector and spec.stocks_per_sector:
                 continue                     # 可选标的太少，宁可不配这个板块
             if spec.stocks_per_sector and spec.stocks_per_sector < len(cand):
-                sc = sec_score.loc[d].reindex(cand)
-                sc = sc.dropna()
+                sc = sc_today.reindex(cand).dropna()
                 if sc.empty:
                     continue
                 cand = list(sc.sort_values(ascending=False).index[:spec.stocks_per_sector])
             picks.extend(cand)
+            kept_sectors.append(sec)
             detail_rows.append({"date": d, "sector": sec,
-                                "momentum": float(mom.at[d, sec]),
+                                "score": float(mom.at[d, sec]) if pd.notna(mom.at[d, sec]) else np.nan,
                                 "n_candidates": len(cand)})
 
         picks = list(dict.fromkeys(picks))          # 去重保序
+
+        # ---- 目标总仓位：市场趋势过滤 × 按合格板块数降仓 ----
+        # 不变量：exposure[d] 必须恒等于 weights.loc[d].sum()
+        exp = 1.0
+        if spec.market_ma and not bool(mkt_ok.get(d, True)):
+            exp = spec.defensive_exposure
+        if spec.scaled_exposure and spec.top_sectors:
+            exp *= min(1.0, len(kept_sectors) / spec.top_sectors)
+        exp = float(min(max(exp, spec.min_exposure), 1.0))
         if not picks:
+            exp = 0.0                      # 一只票都选不出来 -> 目标就是空仓
+        exposure.at[d] = exp
+
+        if not picks or exp <= 0:
+            # 明确空仓：整行写 0（不是 NaN），引擎才会执行卖出
+            weights.loc[d] = 0.0
             continue
 
-        if spec.sector_weighting == "momentum" and chosen:
+        if spec.sector_weighting == "momentum" and kept_sectors:
             # 板块按动量强弱分配权重。
             # ⚠️ 不能简单用 (m - m.min()) 归一化：动量横向差异一大，最弱的板块
             # 权重会被打到 1e-9，策略悄悄退化成"单板块押注"。
             # 这里先线性映射到 [0,1] 再抬底到 0.5，保证最弱的板块仍拿到
             # 最强板块一半的份额 —— 强弱有别但不过度集中。
-            m = mom.loc[d, chosen].dropna()
+            m = mom.loc[d, kept_sectors].dropna()
             if len(m) >= 2 and m.max() > m.min():
                 u = 0.5 + 0.5 * (m - m.min()) / (m.max() - m.min())
                 sec_w = (u / u.sum()).to_dict()
             elif len(m) == 1:
                 sec_w = {m.index[0]: 1.0}
             else:
-                sec_w = {s: 1.0 / len(chosen) for s in chosen}
+                sec_w = {s: 1.0 / len(kept_sectors) for s in kept_sectors}
         else:
-            sec_w = {s: 1.0 / max(len(chosen), 1) for s in chosen}
+            sec_w = {s: 1.0 / max(len(kept_sectors), 1) for s in kept_sectors}
 
         w = {}
-        for sec in chosen:
+        for sec in kept_sectors:
             members = [c for c in cols_by_sector.get(sec, []) if c in picks]
             if not members:
                 continue
             for c in members:
                 w[c] = sec_w.get(sec, 0.0) / len(members)
-        if w:
-            weights.loc[d, list(w.keys())] = list(w.values())
+        if not w:
+            weights.loc[d] = 0.0
+            continue
 
-    # 归一化 + 单票上限
-    row_sum = weights.sum(axis=1)
-    weights = weights.div(row_sum.replace(0, np.nan), axis=0)
+        # 权重和 = 目标仓位（选中的部分按比例缩放到 exp），其余是现金
+        total = sum(w.values())
+        weights.loc[d] = 0.0                      # 先清零，保证未入选的票目标为 0
+        weights.loc[d, list(w.keys())] = [v / total * exp for v in w.values()]
+
     if spec.max_weight:
+        # cap_weights 会重归一化到 1，所以对"仓位 <1"的行要先还原比例
         filled = weights.fillna(0.0)
-        weights = cap_weights(filled, spec.max_weight).where(weights.notna())
+        capped = cap_weights(filled, spec.max_weight)
+        weights = capped.where(weights.notna())
 
     detail = pd.DataFrame(detail_rows)
-    n_hold = weights.notna().sum(axis=1)
+    n_hold = (weights > 0).sum(axis=1)
     n_hold = n_hold[n_hold > 0]
     return RotationPlan(weights=weights, selected_sectors=sel, momentum=mom,
-                        holding_detail=detail, n_holdings=n_hold)
+                        holding_detail=detail, n_holdings=n_hold,
+                        exposure=exposure.dropna())
 
 
 def sector_momentum_ic(sector_ret: pd.DataFrame, lookback: int = 60,
@@ -444,6 +557,10 @@ def plan_summary(plan: RotationPlan) -> str:
     L.append(f"  调仓次数    : {len(n)}")
     L.append(f"  平均持股数  : {n.mean():.1f}  (最少 {int(n.min())}, 最多 {int(n.max())})")
     L.append(f"  空仓调仓日  : {int((n == 0).sum())}")
+    if plan.exposure is not None and len(plan.exposure):
+        e = plan.exposure
+        L.append(f"  平均目标仓位: {e.mean():.1%}  (最低 {e.min():.0%}, 最高 {e.max():.0%})")
+        L.append(f"  空仓期数    : {int((e <= 0).sum())} / {len(e)}")
     if not plan.holding_detail.empty:
         top = plan.holding_detail.groupby("sector").size().sort_values(ascending=False)
         L.append(f"  被选中过的板块数: {len(top)}")

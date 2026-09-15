@@ -137,7 +137,7 @@ def main():
     ap.add_argument("--lookback", type=int, default=60)
     ap.add_argument("--skip", type=int, default=5)
     ap.add_argument("--secondary", default="amount",
-                    choices=["amount", "low_vol", "none"])
+                    choices=["amount", "low_vol", "large_cap", "neutral_cap", "none"])
     ap.add_argument("--direction", default="momentum",
                     choices=["momentum", "reversal"],
                     help="momentum=买动量最强的板块；reversal=买跌得最惨的板块")
@@ -145,17 +145,31 @@ def main():
                     choices=["equal", "momentum"])
     ap.add_argument("--max-weight", type=float, default=0.0)
     ap.add_argument("--no-vol-adjust", action="store_true")
+    # ---- 改进 1：风险控制 ----
+    ap.add_argument("--abs-threshold", type=float, default=None,
+                    help="绝对动量门槛：打分低于此值的板块不持有（momentum 下设 0 = 只买上涨的板块）")
+    ap.add_argument("--scaled-exposure", action="store_true",
+                    help="按合格板块数线性降仓（只选出 2/5 个 -> 仓位 40%%，其余持币）")
+    ap.add_argument("--min-exposure", type=float, default=0.0, help="目标仓位下限")
+    ap.add_argument("--market-ma", type=int, default=0,
+                    help=">0 启用市场趋势过滤：指数在 N 日均线上方才满仓")
+    ap.add_argument("--defensive-exposure", type=float, default=0.0,
+                    help="趋势过滤判定为风险期时的目标仓位（0=空仓持币）")
     # 优化
     ap.add_argument("--optimize", action="store_true", help="在训练集上网格搜索")
     ap.add_argument("--objective", default="sharpe",
                     choices=["sharpe", "calmar", "annual_return", "total_return",
                              "information_ratio"])
-    ap.add_argument("--grid", default="full", choices=["full", "quick"],
-                    help="full=48 组（4×3×2×2）；quick=8 组，用于快速跑方向对照")
+    ap.add_argument("--grid", default="full", choices=["full", "quick", "improve"],
+                    help="full=48 组；quick=4 组；improve=6 组（改进项验证用）")
     ap.add_argument("--optimize-direction", action="store_true",
                     help="把 momentum/reversal 也纳入搜索（组数翻倍）")
     ap.add_argument("--compare-direction", action="store_true",
                     help="用最优参数把 momentum / reversal 两个方向在训练集和测试集上各跑一遍，出对照表")
+    ap.add_argument("--compare-improvements", action="store_true",
+                    help="把风险控制改进项（绝对动量/趋势过滤/降仓/风格中性）在训练集和测试集上各跑一遍")
+    ap.add_argument("--compare-only", action="store_true",
+                    help="跑完对照实验就结束，不再出完整报告（对照实验本身要十几分钟）")
     ap.add_argument("--n-grid", type=int, default=10)
     # 输出
     ap.add_argument("--outdir", default="results/sector_rotation")
@@ -236,12 +250,19 @@ def main():
           f"{sd.sector_ret.shape[0]} 交易日  ({time.time()-t0:.0f}s)")
 
     def factory(pnl, msk, params):
+        kw = {k: v for k, v in params.items()}
         spec = SectorRotationSpec(rebalance=args.rebalance,
                                   secondary=args.secondary,
                                   sector_weighting=args.sector_weighting,
-                                  max_weight=args.max_weight, **params)
+                                  max_weight=args.max_weight,
+                                  abs_threshold=args.abs_threshold,
+                                  scaled_exposure=args.scaled_exposure,
+                                  min_exposure=args.min_exposure,
+                                  market_ma=args.market_ma,
+                                  defensive_exposure=args.defensive_exposure,
+                                  **kw)
         return build_rotation_weights(pnl, msk, sector_map, spec,
-                                      sector_data=sd).weights
+                                      sector_data=sd, market_close=bench).weights
 
     base_params = dict(
         lookback=args.lookback, skip=args.skip,
@@ -259,6 +280,14 @@ def main():
             space = ParamSpace({
                 "lookback": [20, 60, 120, 250],
                 "top_sectors": [5],
+                "stocks_per_sector": [5],
+                "vol_adjust": [True],
+            })
+        elif args.grid == "improve":
+            # 改进项搜索：风控开关 × 选股方式（比 full 更聚焦，组数可控）
+            space = ParamSpace({
+                "lookback": [60, 120, 250],
+                "top_sectors": [5, 8],
                 "stocks_per_sector": [5],
                 "vol_adjust": [True],
             })
@@ -332,6 +361,87 @@ def main():
                 show_cmp[c] = show_cmp[c].map(lambda x: f"{x:+.3f}")
         print(show_cmp.to_string(index=False))
 
+    # ---------- 4c. 改进项对照 ----------
+    if args.compare_improvements:
+        banner("4c. 改进项对照（同样参数，训练/测试各跑一遍）", "-")
+        # 每一行 = 在基线之上叠加一组风控/风格开关。
+        # ⚠️ 方法论：只在训练集上挑"哪个改进有效"，测试集的结果只用于验证，
+        #    不允许回头再改选择。下面的排序与结论都基于样本内。
+        variants = [
+            ("基线（无风控）", {}),
+            ("+绝对动量>0", {"abs_threshold": 0.0}),
+            ("+趋势过滤 MA200", {"market_ma": 200}),
+            ("+绝对动量+趋势过滤", {"abs_threshold": 0.0, "market_ma": 200}),
+            ("+按合格数降仓", {"abs_threshold": 0.0, "scaled_exposure": True}),
+            ("+大盘选股", {"secondary": "large_cap"}),
+            ("+市值中性选股", {"secondary": "neutral_cap"}),
+            ("+趋势过滤+市值中性", {"market_ma": 200, "secondary": "neutral_cap"}),
+        ]
+
+        def make_factory(ov):
+            def fac(pnl, msk, params):
+                spec = SectorRotationSpec(
+                    rebalance=args.rebalance,
+                    secondary=ov.get("secondary", args.secondary),
+                    sector_weighting=args.sector_weighting,
+                    max_weight=args.max_weight,
+                    abs_threshold=ov.get("abs_threshold", args.abs_threshold),
+                    scaled_exposure=ov.get("scaled_exposure", args.scaled_exposure),
+                    min_exposure=args.min_exposure,
+                    market_ma=ov.get("market_ma", args.market_ma),
+                    defensive_exposure=args.defensive_exposure,
+                    **{**best_params, **params})
+                return build_rotation_weights(pnl, msk, sector_map, spec,
+                                              sector_data=sd,
+                                              market_close=bench).weights
+            return fac
+
+        rows = []
+        for label, ov in variants:
+            fac = make_factory(ov)
+            t0 = time.time()
+            r_tr = run_segment(panel, mask, fac, {}, warmup_start,
+                               split.start, split.split, engine_kwargs)
+            r_te = run_segment(panel, mask, fac, {}, warmup_start,
+                               split.split, split.end, engine_kwargs)
+            rows.append({
+                "改进项": label,
+                "内_年化": r_tr["metrics"].annual_return,
+                "内_夏普": r_tr["metrics"].sharpe_ratio,
+                "内_回撤": r_tr["metrics"].max_drawdown,
+                "外_年化": r_te["metrics"].annual_return,
+                "外_夏普": r_te["metrics"].sharpe_ratio,
+                "外_回撤": r_te["metrics"].max_drawdown,
+                "外_波动": r_te["metrics"].annual_volatility,
+            })
+            print(f"  {label:<20} 内 夏普 {rows[-1]['内_夏普']:+.3f} "
+                  f"回撤 {rows[-1]['内_回撤']:+.1%}  |  "
+                  f"外 夏普 {rows[-1]['外_夏普']:+.3f} "
+                  f"回撤 {rows[-1]['外_回撤']:+.1%}   ({time.time()-t0:.0f}s)")
+        imp = pd.DataFrame(rows)
+        imp.to_csv(os.path.join(args.outdir, "improvements.csv"),
+                   index=False, encoding="utf-8-sig")
+        print()
+        show = imp.copy()
+        for c in show.columns:
+            if "回撤" in c or "年化" in c or "波动" in c:
+                show[c] = show[c].map(lambda x: f"{x:+.2%}")
+            elif "夏普" in c:
+                show[c] = show[c].map(lambda x: f"{x:+.3f}")
+        print(show.to_string(index=False))
+        # 只用样本内排序 —— 样本外是验证，不是选择依据
+        best_in = imp.sort_values("内_夏普", ascending=False).iloc[0]
+        print(f"\n  >>> 样本内最优改进项: {best_in['改进项']}  "
+              f"(内 夏普 {best_in['内_夏普']:+.3f})")
+        base = imp.iloc[0]
+        print(f"      相对基线：样本内夏普 {base['内_夏普']:+.3f} -> {best_in['内_夏普']:+.3f}，"
+              f"样本外夏普 {base['外_夏普']:+.3f} -> {best_in['外_夏普']:+.3f}")
+        print(f"      对应样本外回撤 {base['外_回撤']:+.1%} -> {best_in['外_回撤']:+.1%}")
+
+    if args.compare_only and (args.compare_improvements or args.compare_direction):
+        banner("对照实验完成（--compare-only，跳过完整报告）")
+        return 0
+
     # ---------- 5. 样本外 + 全区间 ----------
     banner("4. 样本外验证", "-")
     tr_out = run_segment(panel, mask, factory, best_params, warmup_start,
@@ -369,8 +479,14 @@ def main():
         panel, mask, sector_map,
         SectorRotationSpec(rebalance=args.rebalance, secondary=args.secondary,
                            sector_weighting=args.sector_weighting,
-                           max_weight=args.max_weight, **best_params),
-        sector_data=sd)
+                           max_weight=args.max_weight,
+                           abs_threshold=args.abs_threshold,
+                           scaled_exposure=args.scaled_exposure,
+                           min_exposure=args.min_exposure,
+                           market_ma=args.market_ma,
+                           defensive_exposure=args.defensive_exposure,
+                           **best_params),
+        sector_data=sd, market_close=bench)
 
     # ---------- 5b. 对照组：全市场等权 ----------
     banner("5b. 对照组：全市场等权", "-")

@@ -165,7 +165,11 @@ def test_select_sectors_topk_and_guard():
 
 
 def test_rotation_weights_structure():
-    """目标权重：调仓日和为 1、非调仓日为 NaN、只买掩码内的票"""
+    """目标权重：调仓日和 = 目标仓位、非调仓日为 NaN、只买掩码内的票
+
+    注意语义变化：调仓日若一只票都选不出来，整行写 **0**（明确持币），
+    而不是 NaN —— 引擎把 NaN 行当成"今天不调仓"，就没法清仓。
+    """
     p, smap, codes, sectors = _panel(n_days=200, n_codes=40, n_sectors=4, seed=6)
     mask = pd.DataFrame(True, index=p["close"].index, columns=codes)
     mask.iloc[:, :5] = False                     # 前 5 只永久剔除
@@ -175,15 +179,23 @@ def test_rotation_weights_structure():
     w = plan.weights
     reb = w.dropna(how="all")
     assert len(reb) > 0, "应产生调仓"
-    assert np.allclose(reb.sum(axis=1).values, 1.0), "调仓日权重和必须为 1"
+    # 不变量：exposure[d] 恒等于 weights.loc[d].sum()
+    reb_exp = plan.exposure.reindex(reb.index)
+    assert np.allclose(reb.sum(axis=1).values, reb_exp.values, atol=1e-12), \
+        "每行权重和必须等于当日目标仓位"
+    # 未启用任何风控 -> 目标仓位只可能是 0（预热期选不出票）或 1（满仓）
+    assert set(np.round(plan.exposure.unique(), 9)) <= {0.0, 1.0}
+    sums = reb.sum(axis=1)
+    assert (sums > 0).sum() >= len(sums) - 4, "只有开头预热期才该空仓"
+    assert np.allclose(sums[sums > 0].values, 1.0), "有持仓的调仓日权重和必须为 1"
     assert w.notna().sum().sum() == reb.notna().sum().sum(), "非调仓日必须全 NaN"
     assert reb[codes[:5]].fillna(0).values.sum() == 0, "不能买掩码外的股票"
-    n = reb.notna().sum(axis=1)
+    n = (reb > 0).sum(axis=1)
     assert n.max() <= 6, f"最多 2 板块 × 3 只 = 6 只，实得 {n.max()}"
     # 调仓日必须落在月初
     assert all(pd.Timestamp(d).day <= 7 for d in reb.index)
     print(f"[OK] 目标权重结构正确：{len(reb)} 次调仓、持股 {int(n.min())}~{int(n.max())} 只、"
-          f"权重和=1、非调仓日全 NaN、掩码外 0 仓位")
+          f"权重和=目标仓位、非调仓日全 NaN、掩码外 0 仓位")
 
 
 def test_rotation_only_holds_selected_sectors():
@@ -194,7 +206,11 @@ def test_rotation_only_holds_selected_sectors():
                               stocks_per_sector=4, rebalance="M", min_sectors=1)
     plan = build_rotation_weights(p, mask, smap, spec)
     for d in plan.weights.dropna(how="all").index:
-        held = plan.weights.loc[d].dropna().index
+        # ⚠️ 用 >0 取持仓：空仓行整行都是 0（不是 NaN），dropna() 会当成"持有全部股票"
+        row = plan.weights.loc[d]
+        held = row[row > 0].index
+        if len(held) == 0:
+            continue
         selected = set(plan.momentum.loc[d].dropna()
                        .sort_values(ascending=False).index[:1])
         held_sectors = set(smap[c] for c in held)
@@ -213,11 +229,13 @@ def test_sector_weighting_momentum_normalized():
                               sector_weighting="momentum", min_sectors=1)
     plan = build_rotation_weights(p, mask, smap, spec)
     reb = plan.weights.dropna(how="all")
-    assert np.allclose(reb.sum(axis=1).values, 1.0), "动量加权后仍须归一化"
+    live = reb[reb.sum(axis=1) > 0]            # 预热期是明确空仓行，不参与
+    assert np.allclose(live.sum(axis=1).values, 1.0), "动量加权后仍须归一化"
 
     # ⚠️ 必须 dropna：reb 是完整宽表，未持仓的票是 NaN，
     # 直接 groupby(...).sum() 会把这些板块算成 0 权重（那是 NaN 求和，不是真 0）
-    last = reb.iloc[-1].dropna()
+    last = live.iloc[-1]
+    last = last[last > 0]
     sec_w = last.groupby(smap.reindex(last.index)).sum().sort_values(ascending=False)
     assert abs(sec_w.sum() - 1.0) < 1e-9
     # 关键回归：最弱板块不能被压成 ~0（早期实现把它打到 1e-9，等于单板块押注）
@@ -230,14 +248,19 @@ def test_sector_weighting_momentum_normalized():
 
 
 def test_rotation_survives_empty_mask():
-    """股票池全空时不应崩溃，只应空仓"""
+    """股票池全空时不应崩溃，只应空仓（整行 0，仓位 0）"""
     p, smap, codes, sectors = _panel(n_days=200, n_codes=20, n_sectors=2, seed=0)
     mask = pd.DataFrame(False, index=p["close"].index, columns=codes)
     plan = build_rotation_weights(p, mask, smap,
                                   SectorRotationSpec(lookback=60, skip=5,
                                                      rebalance="M", min_sectors=1))
-    assert plan.weights.notna().sum().sum() == 0, "全空掩码应产出空仓"
-    print("[OK] 股票池全空 -> 空仓且不抛异常")
+    assert float(plan.weights.fillna(0.0).abs().sum().sum()) == 0, "全空掩码应产出空仓"
+    assert (plan.exposure == 0).all(), "目标仓位应全为 0"
+    assert plan.n_holdings.empty, "没有持仓"
+    reb = plan.weights.dropna(how="all")
+    assert len(reb) > 0 and not reb.isna().any().any(), \
+        "空仓行必须是 0 而不是 NaN，否则引擎不会执行清仓"
+    print("[OK] 股票池全空 -> 明确空仓（整行 0，非 NaN）且不抛异常")
 
 
 def test_sector_momentum_ic_sign():
@@ -307,6 +330,116 @@ def test_sector_momentum_ic_no_lookahead():
     print(f"[OK] 板块动量 IC 无未来函数（前 {len(a)} 期不受未来数据影响）")
 
 
+# ============================================================
+# 改进项：风险控制与风格中性
+# ============================================================
+def test_abs_threshold_filters_weak_sectors():
+    """绝对动量门槛：打分不达标的板块不得入选"""
+    p, smap, codes, sectors = _panel(n_days=300, n_codes=40, n_sectors=6,
+                                     seed=31, drift={0: 0.0025})
+    mask = pd.DataFrame(True, index=p["close"].index, columns=codes)
+    base = SectorRotationSpec(lookback=60, skip=5, top_sectors=4,
+                              stocks_per_sector=3, rebalance="M", min_sectors=1)
+    plan_all = build_rotation_weights(p, mask, smap, base)
+    plan_thr = build_rotation_weights(
+        p, mask, smap,
+        SectorRotationSpec(lookback=60, skip=5, top_sectors=4, stocks_per_sector=3,
+                           rebalance="M", min_sectors=1, abs_threshold=0.0))
+    # 门槛为 0 时，选中板块的打分必须全部为正
+    for d in plan_thr.selected_sectors.index:
+        for s in plan_thr.momentum.columns:
+            if bool(plan_thr.selected_sectors.at[d, s]):
+                assert float(plan_thr.momentum.at[d, s]) > 0, \
+                    f"{str(d)[:10]} 选中的 {s} 打分应为正"
+    n_all = plan_all.selected_sectors.sum().sum()
+    n_thr = plan_thr.selected_sectors.sum().sum()
+    assert n_thr <= n_all, "加门槛后选中的板块数不应变多"
+    print(f"[OK] 绝对动量门槛生效：选中板块数 {n_all} -> {n_thr}，且入选者打分全为正")
+
+
+def test_market_filter_goes_to_cash_and_row_is_zero():
+    """市场趋势过滤：指数跌破均线时目标仓位降到防守仓，且**整行写 0 而不是 NaN**
+
+    这是最容易踩的坑：引擎把 NaN 行理解成"今天不调仓"，空仓写成 NaN 的话
+    该卖的票根本卖不掉，回撤控制形同虚设。
+    """
+    p, smap, codes, sectors = _panel(n_days=400, n_codes=30, n_sectors=4, seed=32)
+    mask = pd.DataFrame(True, index=p["close"].index, columns=codes)
+    dates = p["close"].index
+    # 构造一条前 200 天在均线上、后 200 天跌破均线的"指数"
+    mc = pd.Series(np.r_[np.linspace(100, 200, 200), np.linspace(200, 90, 200)],
+                   index=dates)
+    spec = SectorRotationSpec(lookback=60, skip=5, top_sectors=2,
+                              stocks_per_sector=3, rebalance="M", min_sectors=1,
+                              market_ma=60, defensive_exposure=0.0)
+    plan = build_rotation_weights(p, mask, smap, spec, market_close=mc)
+    assert (plan.exposure < 1).any(), "应有处于防守仓的调仓日"
+    reb = plan.weights.dropna(how="all")
+    cash_rows = reb[reb.sum(axis=1) <= 1e-12]
+    assert len(cash_rows) > 0, "应出现空仓调仓日"
+    assert not cash_rows.isna().any().any(), \
+        "空仓行必须是 0（引擎才会执行卖出），不能是 NaN"
+    assert np.allclose(plan.weights.dropna(how="all").sum(axis=1),
+                       plan.exposure.reindex(plan.weights.dropna(how="all").index),
+                       atol=1e-9), "每行权重和必须等于当日目标仓位"
+    print(f"[OK] 市场趋势过滤：{len(cash_rows)} 个空仓期，权重行显式为 0 且和=目标仓位")
+
+
+def test_scaled_exposure_reduces_position():
+    """按合格板块数线性降仓：只选出 K' 个板块 -> 仓位 = K'/K"""
+    p, smap, codes, sectors = _panel(n_days=300, n_codes=40, n_sectors=6,
+                                     seed=33, drift={0: 0.003})
+    mask = pd.DataFrame(True, index=p["close"].index, columns=codes)
+    spec = SectorRotationSpec(lookback=60, skip=5, top_sectors=4,
+                              stocks_per_sector=3, rebalance="M", min_sectors=1,
+                              abs_threshold=0.0, scaled_exposure=True)
+    plan = build_rotation_weights(p, mask, smap, spec)
+    reb = plan.weights.dropna(how="all")
+    n_sel = plan.selected_sectors.sum(axis=1).reindex(reb.index)
+    expect = (n_sel / 4.0).clip(upper=1.0)
+    got = reb.sum(axis=1)
+    assert np.allclose(got.values, expect.values, atol=1e-9), \
+        f"仓位应 = 合格板块数/目标板块数\n期望 {expect.values[:6]}\n实得 {got.values[:6]}"
+    partial = got[(got > 0) & (got < 1)]
+    assert len(partial) > 0, "应出现部分仓位（合格板块不足 4 个的调仓日）"
+    print(f"[OK] 按合格数降仓：{len(partial)} 个部分仓位期，"
+          f"仓位区间 {partial.min():.0%} ~ {partial.max():.0%}（= 合格数/4）")
+
+
+def test_large_cap_and_neutral_cap_pick_differently():
+    """市值选股：large_cap 挑最大市值，neutral_cap 挑最接近板块中位数的"""
+    from strategy.sector_rotation import _neutralize_by_sector, _sector_columns
+    p, smap, codes, sectors = _panel(n_days=120, n_codes=20, n_sectors=2, seed=34)
+    # 人为指定市值：S0 的成员市值 1~10，S1 的成员 100~1000
+    mv = pd.DataFrame(np.nan, index=p["close"].index, columns=codes)
+    for i, c in enumerate(codes):
+        mv[c] = 10.0 ** (i % 10)
+    p["total_mv"] = mv
+    mask = pd.DataFrame(True, index=p["close"].index, columns=codes)
+
+    big = build_rotation_weights(
+        p, mask, smap, SectorRotationSpec(lookback=20, skip=2, top_sectors=2,
+                                          stocks_per_sector=2, rebalance="M",
+                                          min_sectors=1, secondary="large_cap"))
+    neu = build_rotation_weights(
+        p, mask, smap, SectorRotationSpec(lookback=20, skip=2, top_sectors=2,
+                                          stocks_per_sector=2, rebalance="M",
+                                          min_sectors=1, secondary="neutral_cap"))
+    d = big.weights.dropna(how="all").index[-1]
+    big_pick = list(big.weights.loc[d][big.weights.loc[d] > 0].index)
+    neu_pick = list(neu.weights.loc[d][neu.weights.loc[d] > 0].index)
+    assert big_pick != neu_pick, "两种选股方式不应选出完全相同的票"
+    # large_cap 选出的平均市值应高于 neutral_cap
+    assert mv.loc[d, big_pick].mean() > mv.loc[d, neu_pick].mean(), \
+        "large_cap 选出的平均市值应更高"
+    # neutral_cap 的分数确实按板块内分位构造：最接近中位数的得 1
+    cb = _sector_columns(smap, codes)
+    sc = _neutralize_by_sector(mv.loc[d].rank(pct=True), cb)
+    assert sc.max() <= 1.0 + 1e-9 and sc.min() >= -1e-9
+    print(f"[OK] 市值选股：large_cap 均市值 {mv.loc[d, big_pick].mean():,.0f} > "
+          f"neutral_cap {mv.loc[d, neu_pick].mean():,.0f}")
+
+
 def test_holding_history_shape():
     p, smap, codes, sectors = _panel(n_days=200, n_codes=40, n_sectors=4, seed=2)
     mask = pd.DataFrame(True, index=p["close"].index, columns=codes)
@@ -335,5 +468,9 @@ if __name__ == "__main__":
     test_rotation_survives_empty_mask()
     test_sector_momentum_ic_sign()
     test_sector_momentum_ic_no_lookahead()
+    test_abs_threshold_filters_weak_sectors()
+    test_market_filter_goes_to_cash_and_row_is_zero()
+    test_scaled_exposure_reduces_position()
+    test_large_cap_and_neutral_cap_pick_differently()
     test_holding_history_shape()
     print("\n全部板块轮动策略测试通过")
