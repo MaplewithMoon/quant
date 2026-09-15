@@ -56,6 +56,7 @@ def load_panel(start: str, end: str, codes: list = None,
     daily_glob = _glob(dir_of("daily"), y0, y1)
     con = duckdb.connect()
     con.execute("PRAGMA threads=4")
+    con.execute("SET enable_progress_bar=false")   # 关掉扫描进度条，避免刷屏
 
     where = ["trade_date >= ?", "trade_date <= ?"]
     params = [pd.Timestamp(start), pd.Timestamp(end)]

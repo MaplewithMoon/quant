@@ -241,6 +241,8 @@ def main():
     parser = argparse.ArgumentParser(description="数据库质量校验")
     parser.add_argument("--check", choices=["unique", "schema", "coverage", "all"], default="all")
     parser.add_argument("--quick", action="store_true", help="抽样快速检查")
+    parser.add_argument("--no-strict-exit", action="store_true",
+                        help="即使发现问题也返回 0（默认发现问题返回 1，供 CI/调度做门禁）")
     args = parser.parse_args()
 
     if args.check in ("unique", "all"):
@@ -261,5 +263,12 @@ def main():
         print("全部检查通过，无问题")
     print("=" * 60)
 
+    # 返回非零退出码，让 CI / 调度 / 监控能感知校验失败
+    # （旧实现只打印，退出码恒为 0 → 脏数据静默入库，门禁形同虚设）
+    if args.no_strict_exit:
+        return 0
+    return 1 if WARN else 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

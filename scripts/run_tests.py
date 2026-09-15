@@ -16,6 +16,11 @@ TESTS = [
     "tests/test_market_rules.py",
     "tests/test_impact.py",
     "tests/test_optimizer.py",
+    "tests/test_storage.py",
+    "tests/test_factors.py",
+    "tests/test_universe.py",
+    "tests/test_portfolio_backtest.py",
+    "tests/test_attribution.py",
 ]
 
 
