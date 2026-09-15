@@ -677,6 +677,7 @@ class JQEngine:
         self.verbose = verbose
         self.volume_limit = volume_limit
         self.rejections: Dict[str, int] = {}
+        self.trades: List[dict] = []
         self.current_dt = datetime.datetime.combine(data.dates[0].date(),
                                                     datetime.time(9, 30))
         self.previous_date = data.dates[0].date()
@@ -825,6 +826,10 @@ class JQEngine:
                 order.reason = str(e)[:60]
                 return order
             order.filled, order.fees, order.status = size, fees, OrderStatus.held
+            self.trades.append({"timestamp": pd.Timestamp(self.current_date),
+                                "code": code, "action": "buy", "size": float(size),
+                                "price": float(px), "fees": float(fees),
+                                "pnl": 0.0})
         else:                             # 卖出
             ok, why = self.rules.check_sell(bar, px)
             if not ok:
@@ -838,12 +843,16 @@ class JQEngine:
                 return order
             fees = self.fees_of(size * px, OrderSide.SELL)
             try:
-                self.pf.sell(code, size, px, fees=fees)
+                pnl = self.pf.sell(code, size, px, fees=fees)
             except ValueError as e:
                 self._reject(str(e)[:40])
                 order.reason = str(e)[:60]
                 return order
             order.filled, order.fees, order.status = size, fees, OrderStatus.held
+            self.trades.append({"timestamp": pd.Timestamp(self.current_date),
+                                "code": code, "action": "sell", "size": float(size),
+                                "price": float(px), "fees": float(fees),
+                                "pnl": float(pnl)})
         return order
 
     # ---------- 事件循环 ----------
@@ -900,6 +909,7 @@ class JQEngine:
                        index=pd.Index([x for x, _ in equity], name="trade_date"))
         return {"equity": eq,
                 "holdings": pd.DataFrame(holdings, index=eq.index),
+                "trades": pd.DataFrame(self.trades),
                 "rejections": dict(self.rejections),
                 "log": list(log.lines)}
 

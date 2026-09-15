@@ -121,6 +121,21 @@ def main():
         print(f"  卡玛 {summ['calmar_ratio']:+.3f}  索提诺 {summ['sortino_ratio']:+.3f}  "
               f"换手相关：持仓 {eng.pf.positions and len(eng.pf.positions)} 只")
 
+        # ---- 聚宽风格 HTML 报告 ----
+        from analytics.jq_report import build_jq_report
+        html_path = os.path.join(args.outdir, f"report_{key}.html")
+        note = ("本报告由本项目引擎生成。与聚宽对照前请先看 "
+                "docs/聚宽策略移植报告.md 的「近似与差异」："
+                "指数已改用真实日线与真实月度成分、ETF 用真实日线；"
+                "但成交价为日线近似（上午开盘 / 下午收盘），聚宽为分钟撮合。")
+        build_jq_report(eq, bench if bench is not None else eq, label,
+                        subtitle=f"{args.start} ~ {args.end}   本金 "
+                                 f"{args.capital:,.0f}   成交价 {args.fill}   "
+                                 f"基准 {bench_code}",
+                        trades=res.get("trades"),
+                        out_path=html_path, extra_notes=note)
+        print(f"  聚宽风格报告 -> {html_path}")
+
         rows.append({
             "策略": key, "名称": label, "基准": bench_code,
             "累计收益": summ["total_return"], "年化收益": summ["annual_return"],

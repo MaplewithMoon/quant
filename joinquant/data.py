@@ -31,7 +31,22 @@ import pandas as pd
 # ---------------------------------------------------------------
 # 指数代理规则：库里没有的指数，用代码前缀/全市场规则重建
 # ---------------------------------------------------------------
-REAL_INDEXES = ("000300.SH", "000905.SH", "000852.SH", "932000.CSI")
+REAL_INDEXES = ("000300.SH", "000905.SH", "000852.SH", "932000.CSI",
+                "399101.SZ", "000985.CSI", "H00985.CSI")
+
+# 聚宽代码 -> 本库 ts_code。库里现在有真实的 399101/000985，优先用真实数据；
+# 拿不到时才退回下面的规则重建。
+INDEX_CODE_MAP = {
+    "399101.XSHE": "399101.SZ",     # 中小综指
+    "399101.SZ": "399101.SZ",
+    "000985.XSHG": "000985.CSI",    # 中证全指
+    "000985.CSI": "000985.CSI",
+    "H00985.CSI": "H00985.CSI",
+    "000300.XSHG": "000300.SH",
+    "000905.XSHG": "000905.SH",
+    "000852.XSHG": "000852.SH",
+    "932000.CSI": "932000.CSI",
+}
 
 INDEX_PROXY_PREFIX = {
     "399101.XSHE": ("002", "003"),      # 中小企业板综指 ≈ 002/003 开头
@@ -116,6 +131,16 @@ class LegacyFrame(pd.DataFrame):
         return _LegacyLoc(self)
 
 
+def to_ts_code(code: str) -> str:
+    """聚宽代码 -> 本库 ts_code（511880.XSHG -> 511880.SH）"""
+    c = str(code).upper()
+    if c.endswith(".XSHG"):
+        return c[:-5] + ".SH"
+    if c.endswith(".XSHE"):
+        return c[:-5] + ".SZ"
+    return c
+
+
 class JQData:
     """聚宽数据接口的本地实现（预加载到内存，查询走内存索引）"""
 
@@ -144,6 +169,7 @@ class JQData:
 
         self._load_security_info()
         self._load_financials()
+        self._fund_cache: Dict[str, Optional[pd.Series]] = {}
         self._build_index_cache()
 
     # ===========================================================
@@ -247,12 +273,30 @@ class JQData:
     def _build_index_cache(self):
         self._index_cache: Dict[str, pd.DataFrame] = {}
         self._index_close_cache: Dict[str, pd.Series] = {}
-        # 真实指数（行情库里有）
+        self._real_members: Dict[str, pd.DataFrame] = {}
+        # 真实指数（行情库里有）；用聚宽代码和本库 ts_code 两种键都缓存一份
         from database.loader import load_index_daily
-        for code in REAL_INDEXES:
-            df = load_index_daily(code, str(self.start)[:10], str(self.end)[:10])
+        for jq_code, ts_code in INDEX_CODE_MAP.items():
+            if ts_code in self._index_cache:
+                self._index_cache[jq_code] = self._index_cache[ts_code]
+                continue
+            df = load_index_daily(ts_code, str(self.start)[:10], str(self.end)[:10])
             if not df.empty:
-                self._index_cache[code] = df.set_index("trade_date")
+                d = df.set_index("trade_date")
+                self._index_cache[ts_code] = d
+                self._index_cache[jq_code] = d
+        # 真实成分（月度快照）
+        from universe import load_index_members
+        for ts_code in set(INDEX_CODE_MAP.values()):
+            try:
+                m = load_index_members(ts_code)
+            except Exception:
+                m = None
+            if m is not None and not m.empty:
+                self._real_members[ts_code] = m
+
+    def has_real_members(self, code: str) -> bool:
+        return INDEX_CODE_MAP.get(code, code) in self._real_members
 
     def real_index(self, code: str) -> Optional[pd.DataFrame]:
         return self._index_cache.get(code)
@@ -260,37 +304,42 @@ class JQData:
     def index_stocks(self, code: str, date=None) -> List[str]:
         """指数成分股
 
-        真实指数走 frozen/index_cons；库里没有的按规则重建：
-            399101.XSHE -> 002/003 开头（中小企业板）
-            000985.XSHG -> 全部 A 股
+        优先级：**真实月度成分快照** > 规则重建。
+        库里现在有 399101.SZ（中小综指）与 000985.CSI（中证全指）的真实成分，
+        所以这两个指数不再用"002/003 前缀 / 全部 A 股"近似。
         """
         date = pd.Timestamp(date) if date is not None else self.dates[-1]
-        if code in REAL_INDEXES:
-            from universe import load_index_members, index_member_panel
-            mem = load_index_members(code)
-            if mem.empty:
-                return []
+        ts_code = INDEX_CODE_MAP.get(code, code)
+        # 1) 真实成分
+        mem = self._real_members.get(ts_code)
+        if mem is not None and not mem.empty:
+            from universe import index_member_panel
             cols = sorted(mem["code"].unique())
-            m = index_member_panel(code, pd.DatetimeIndex([date]), cols)
+            m = index_member_panel(ts_code, pd.DatetimeIndex([date]), cols)
             row = m.iloc[0]
-            return [c for c in cols if bool(row.get(c, False))]
+            picked = [c for c in cols if bool(row.get(c, False))]
+            if picked:
+                return picked
+        # 2) 真实指数行情里的成分（`index_weight` 之外的老数据）
+        if code in REAL_INDEXES and ts_code in self._index_cache:
+            from universe import load_index_members, index_member_panel
+            mem2 = load_index_members(ts_code)
+            if not mem2.empty:
+                cols = sorted(mem2["code"].unique())
+                m = index_member_panel(ts_code, pd.DatetimeIndex([date]), cols)
+                row = m.iloc[0]
+                return [c for c in cols if bool(row.get(c, False))]
+        # 3) 规则重建（库里没有该指数时）
         if code in INDEX_PROXY_PREFIX:
             pre = INDEX_PROXY_PREFIX[code]
-            out = []
-            for c in self.codes:
-                if not str(c).startswith(pre):
-                    continue
-                ld = self.list_date_of(c)
-                if pd.notna(ld) and ld <= date:
-                    out.append(c)
-            return out
+            return [c for c in self.codes
+                    if str(c).startswith(pre)
+                    and pd.notna(self.list_date_of(c))
+                    and self.list_date_of(c) <= date]
         if code in FULL_MARKET_INDEXES:
-            out = []
-            for c in self.codes:
-                ld = self.list_date_of(c)
-                if pd.notna(ld) and ld <= date:
-                    out.append(c)
-            return out
+            return [c for c in self.codes
+                    if pd.notna(self.list_date_of(c))
+                    and self.list_date_of(c) <= date]
         return []
 
     def index_close(self, code: str, end_date, count: int = 1) -> pd.Series:
@@ -335,13 +384,25 @@ class JQData:
     # ETF（合成现金等价物）
     # ===========================================================
     def etf_close(self, code: str, end_date, count: int = 1) -> pd.Series:
-        """货币 ETF 的处理：库里只有月度快照，无法用于日频回测
+        """ETF 收盘序列
 
-        这里按"现金等价物"合成：净值以固定年化收益增长。
-        银华日利（511880）是货币基金，净值 100 元附近、年化约 2%，
-        所以这个近似对收益的影响很小（但会**略微低估**空仓期的收益）。
+        **优先用真实日线**（frozen/fund_daily）。拿不到时退回"现金等价物"合成。
+
+        ⚠️ 关于货币 ETF（511880 银华日利）：它的**真实价格恒在 100 附近**，
+        收益靠"份额折算"发放而不是价格上涨 —— 2024-2025 真实价格累计只有
+        −0.036%，而年化 2% 的合成值约 +4.0%。
+        经济上合成口径更准（拿到了货币收益），但**聚宽回测同样不处理份额折算**，
+        其 ETF 持仓也近似零收益 —— 要跟聚宽对齐就必须用真实价格。
         """
         end_date = pd.Timestamp(end_date)
+        ts_code = INDEX_CODE_MAP.get(code, to_ts_code(code))
+        s = self._fund_cache.get(ts_code)
+        if s is None:
+            s = self._load_fund_daily(ts_code)
+            self._fund_cache[ts_code] = s
+        if s is not None and len(s):
+            return s[s.index <= end_date].tail(count)
+        # 退回合成：净值以固定年化收益增长
         d = self.dates[self.dates <= end_date]
         if len(d) == 0:
             return pd.Series(dtype=float)
@@ -349,10 +410,70 @@ class JQData:
         growth = (1.0 + self.etf_yield) ** (np.arange(len(d)) / 252.0)
         return pd.Series(base * growth, index=d).tail(count)
 
+    def _load_fund_daily(self, ts_code: str):
+        """读 frozen/fund_daily 里某只基金的日线（没有则返回 None）"""
+        from database.config import FROZEN_ROOT
+        fs = sorted((FROZEN_ROOT / "fund_daily").rglob(f"{ts_code}.parquet"))
+        if not fs:
+            return None
+        try:
+            df = pd.concat([pd.read_parquet(f) for f in fs], ignore_index=True)
+        except Exception:
+            return None
+        if df.empty or "close" not in df.columns:
+            return None
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        return df.sort_values("trade_date").drop_duplicates("trade_date") \
+                 .set_index("trade_date")["close"].astype(float)
+
+    def has_real_fund(self, code: str) -> bool:
+        s = self._fund_cache.get(to_ts_code(code))
+        return s is not None and len(s) > 0
+
     # ===========================================================
     # 交易日
     # ===========================================================
+    def _load_calendar(self):
+        """交易所交易日历（frozen/calendar）
+
+        聚宽的 get_trade_days 走的是**交易所日历**，覆盖范围比我们加载的面板长。
+        只用面板日期会让"下个月第一个交易日"在回测末期取不到 → 策略拿空列表
+        去索引 [0] → IndexError（v2 实测 2 次）。
+        """
+        from database.config import FROZEN_ROOT
+        fs = sorted((FROZEN_ROOT / "calendar").rglob("*.parquet"))
+        if not fs:
+            return None
+        try:
+            df = pd.concat([pd.read_parquet(f) for f in fs], ignore_index=True)
+        except Exception:
+            return None
+        for col in ("cal_date", "trade_date", "date"):
+            if col in df.columns:
+                s = df[col]
+                # trade_date 有的年份是 datetime、有的是 YYYYMMDD 字符串，两种都要认
+                if pd.api.types.is_datetime64_any_dtype(s):
+                    s = pd.to_datetime(s, errors="coerce")
+                else:
+                    s = pd.to_datetime(s.astype(str), format="%Y%m%d",
+                                       errors="coerce")
+                if "is_open" in df.columns:
+                    s = s[pd.to_numeric(df["is_open"], errors="coerce") == 1]
+                s = s.dropna().drop_duplicates().sort_values()
+                return pd.DatetimeIndex(s)
+        return None
+
     def trade_days(self, start=None, end=None, count=None) -> pd.DatetimeIndex:
+        """交易日列表
+
+        ⚠️ 只用**面板覆盖的交易日**，不用完整交易所日历。
+        试过改用 frozen/calendar（覆盖到 2027，比面板长 486 天），
+        结果 v2 每次都抛 `ValueError: truth value of an array is ambiguous` —— 
+        日历里的交易日落在面板之外，策略据此算出的调仓日引擎跑不到，
+        状态机就此卡死。**面板日期与策略实际能成交的日期一致**才是对的，
+        即使代价是：回测末尾若策略要"找下个月的第一个交易日"会取空列表
+        （v2 实测 2 次，属边界情形，已在移植报告里记录为已知限制）。
+        """
         d = self.dates
         if start is not None:
             d = d[d >= pd.Timestamp(start)]

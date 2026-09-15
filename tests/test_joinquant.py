@@ -280,29 +280,46 @@ def test_query_in_filter():
 # 指数代理 / PIT
 # ============================================================
 def test_index_proxy_rules():
+    """指数成分：**优先真实月度快照**，拿不到时才退回规则重建"""
     codes = ["000001", "000002", "002001", "002002", "003001", "600000", "300001"]
     p, dates = _panel(n_days=5, codes=codes)
     mgr = JQData(p, dates[0], dates[-1])
     mgr._list_date = pd.Series(pd.Timestamp("2000-01-01"), index=codes)
+
+    # 有真实成分时（库里已下载 399101.SZ / 000985.CSI）必须用真实的
+    if mgr.has_real_members("399101.XSHE"):
+        real = mgr.index_stocks("399101.XSHE", dates[-1])
+        assert len(real) > 100, f"应返回真实中小综指成分，实得 {len(real)} 只"
+        assert all(str(c).startswith(("002", "003", "001", "000")) for c in real)
+        print(f"[OK] 指数成分优先用真实快照：399101.XSHE -> {len(real)} 只")
+    else:
+        print("[SKIP] 库里没有 399101 真实成分，跳过真实优先检查")
+
+    # 清掉真实成分，验证规则重建的兜底路径
+    mgr._real_members = {}
+    mgr._index_cache = {}
     zx = mgr.index_stocks("399101.XSHE", dates[-1])
-    assert set(zx) == {"002001", "002002", "003001"}, f"中小综指代理应为 002/003，实得 {zx}"
+    assert set(zx) == {"002001", "002002", "003001"}, \
+        f"中小综指代理应为 002/003，实得 {zx}"
     full = mgr.index_stocks("000985.XSHG", dates[-1])
     assert set(full) == set(codes), "中证全指代理应为全部 A 股"
     idx = mgr.index_close("399101.XSHE", dates[-1], 5)
     assert len(idx) > 0 and (idx > 0).all(), "重建指数应为正的等权净值"
-    print(f"[OK] 指数代理：399101 -> {sorted(zx)}；000985 -> 全部 {len(full)} 只；"
-          f"重建指数 {len(idx)} 根")
+    print(f"[OK] 无真实成分时退回规则重建：399101 -> {sorted(zx)}；"
+          f"000985 -> 全部 {len(full)} 只；重建指数 {len(idx)} 根")
 
 
 def test_index_proxy_excludes_unlisted():
     codes = ["002001", "002002"]
     p, dates = _panel(n_days=5, codes=codes)
     mgr = JQData(p, dates[0], dates[-1])
+    mgr._real_members = {}          # 强制走规则重建路径（库里有真实成分）
+    mgr._index_cache = {}
     mgr._list_date = pd.Series({"002001": pd.Timestamp("2000-01-01"),
                                 "002002": dates[-1] + pd.Timedelta(days=30)})
     got = mgr.index_stocks("399101.XSHE", dates[-1])
     assert got == ["002001"], f"未上市的不该入选，实得 {got}"
-    print("[OK] 指数代理按 list_date 剔除未上市股票")
+    print("[OK] 指数代理按 list_date 剔除未上市股票（规则重建兜底路径）")
 
 
 def test_financials_asof_is_point_in_time():
@@ -325,14 +342,26 @@ def test_financials_asof_is_point_in_time():
     print("[OK] financials_asof 按 ann_date 对齐：公告前为空、公告后取最新一期")
 
 
-def test_etf_synthetic_series():
+def test_etf_close_prefers_real_then_synthetic():
+    """ETF：**优先真实日线**，没有真实数据时才退回"现金等价物"合成"""
     p, dates = _panel(n_days=252)
     mgr = JQData(p, dates[0], dates[-1], etf_yield=0.02)
-    s = mgr.etf_close("511880.XSHG", dates[-1], 252)
-    assert len(s) == 252
-    assert abs(s.iloc[-1] / s.iloc[0] - 1.02) < 5e-3, "合成 ETF 应按年化 2% 增长"
-    assert s.iloc[0] > 0
-    print(f"[OK] 货币 ETF 合成序列：年化 {s.iloc[-1]/s.iloc[0]-1:.2%}（库里无日线）")
+
+    # 库里没有的代码 -> 合成（年化 2%）
+    syn = mgr.etf_close("999999.XSHG", dates[-1], 252)
+    assert len(syn) == 252
+    assert abs(syn.iloc[-1] / syn.iloc[0] - 1.02) < 5e-3, "合成 ETF 应按年化 2% 增长"
+
+    # 511880 已有真实日线（frozen/fund_daily）-> 必须用真实的
+    if mgr.has_real_fund("511880.XSHG"):
+        real = mgr.etf_close("511880.XSHG", dates[-1], 100)
+        assert len(real) > 0
+        assert not np.allclose(real.values, syn.values[-len(real):]), \
+            "有真实日线时不该再用合成序列"
+        print(f"[OK] ETF：无真实数据时代码合成（年化 2%）；"
+              f"511880 用真实日线 {len(real)} 根")
+    else:
+        print("[OK] ETF：无真实数据时按年化 2% 合成（库里暂无 511880 日线）")
 
 
 # ============================================================
@@ -484,7 +513,7 @@ if __name__ == "__main__":
     test_index_proxy_rules()
     test_index_proxy_excludes_unlisted()
     test_financials_asof_is_point_in_time()
-    test_etf_synthetic_series()
+    test_etf_close_prefers_real_then_synthetic()
     test_positions_returns_zero_for_unheld()
     test_get_price_supports_index_and_etf()
     test_legacy_frame_pandas1_semantics()
