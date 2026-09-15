@@ -87,8 +87,11 @@ def _read_statements(kind: str, columns: List[str]) -> pd.DataFrame:
     if df.empty:
         return df
     df["code"] = df["code"].astype(str).str.zfill(6)
-    df["ann_date"] = pd.to_datetime(df["ann_date"], format="%Y%m%d", errors="coerce")
-    df["end_date"] = pd.to_datetime(df["end_date"], format="%Y%m%d", errors="coerce")
+    # 用统一容错解析：tushare 少数记录的日期是 'YYYY-MM-DD HH:MM:SS'，
+    # 写死 format="%Y%m%d" 会静默变 NaT 并在下一步被 dropna 丢掉。
+    from database.dates import parse_tushare_date
+    df["ann_date"] = parse_tushare_date(df["ann_date"])
+    df["end_date"] = parse_tushare_date(df["end_date"])
     df = df.dropna(subset=["ann_date", "end_date"])
     # 同一 (code, end_date) 多次公告 -> 保留最早那次（as-reported，杜绝用后来的修正值）
     df = (df.sort_values(["code", "end_date", "ann_date"])
@@ -278,8 +281,11 @@ def load_holder_changes(dates: pd.DatetimeIndex, codes,
         return pd.DataFrame(index=dates, columns=list(codes), dtype=float)
 
     df["code"] = df["code"].astype(str).str.zfill(6)
-    df["ann_date"] = pd.to_datetime(df["ann_date"], format="%Y%m%d", errors="coerce")
-    df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce")
+    # holders.ann_date 实测约 1.75% 的行是 'YYYY-MM-DD HH:MM:SS' 格式，
+    # 写死 format="%Y%m%d" 会静默变 NaT 并被 dropna 丢掉（无声的数据损失）。
+    from database.dates import parse_tushare_date
+    df["ann_date"] = parse_tushare_date(df["ann_date"])
+    df["end_date"] = parse_tushare_date(df["end_date"])
     df = df.dropna(subset=["ann_date", "end_date", "holder_num"])
     df = (df.sort_values(["code", "end_date", "ann_date"])
             .drop_duplicates(["code", "end_date"], keep="first"))

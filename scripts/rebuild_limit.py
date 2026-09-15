@@ -35,48 +35,23 @@ import numpy as np
 import pandas as pd
 
 from database.config import FROZEN_ROOT, dir_of
+from database.limit_rules import (BEIJING_PREFIXES, apply_limit_prices,
+                                  base_pct as _base_pct,
+                                  load_st_intervals as _load_st_intervals)
 
 SRC = dir_of("daily")             # db/cleaned/daily_basic
 DST = dir_of("limit")             # db/cleaned/limit_price
 ST_DIR = FROZEN_ROOT / "st"       # db/frozen/st（只读）
 
-BEIJING_PREFIXES = ("920", "43", "83", "87", "88")
-
 
 def base_pct(code: str) -> float:
-    """按板块给出基础涨跌幅限制"""
-    if code.startswith(("688", "689")):        # 科创板
-        return 0.20
-    if code.startswith(("300", "301")):        # 创业板
-        return 0.20
-    if code.startswith(BEIJING_PREFIXES):      # 北交所
-        return 0.30
-    return 0.10                                # 主板
+    """兼容旧调用：板块基础涨跌幅（唯一实现在 database/limit_rules.py）"""
+    return _base_pct(code)
 
 
 def load_st_intervals():
-    """读取 ST 状态区间 -> {code: [(start, end), ...]}（只保留确实带 ST 的区间）"""
-    out = {}
-    if not ST_DIR.exists():
-        return out
-    for f in ST_DIR.glob("year=*/*.parquet"):
-        try:
-            df = pd.read_parquet(f)
-        except Exception:
-            continue
-        recs = []
-        for _, r in df.iterrows():
-            name = str(r.get("name", "")).upper()
-            if "ST" not in name:
-                continue
-            s = pd.to_datetime(r.get("start_date"), errors="coerce")
-            if pd.isna(s):
-                continue
-            e = pd.to_datetime(r.get("end_date"), errors="coerce")
-            recs.append((s, e if not pd.isna(e) else pd.Timestamp("2100-01-01")))
-        if recs:
-            out[f.stem] = recs
-    return out
+    """兼容旧调用：ST 区间（唯一实现在 database/limit_rules.py）"""
+    return _load_st_intervals(ST_DIR)
 
 
 def rebuild():
@@ -106,20 +81,11 @@ def rebuild():
         d["trade_date"] = pd.to_datetime(d["trade_date"])
         d = d.sort_values("trade_date").reset_index(drop=True)
 
-        # 交易所口径：涨跌停价按昨收（除权后参考价）× (1 ± 幅度)，四舍五入到分
-        pct = base_pct(code)
-        if pct == 0.10 and code in st_map:
-            mask = pd.Series(False, index=d.index)
-            for s, e in st_map[code]:
-                mask |= (d["trade_date"] >= s) & (d["trade_date"] <= e)
-            # 主板 ST 为 ±5%，其余主板 ±10%
-            d["limit_pct"] = np.where(mask, 0.05, 0.10)
-        else:
-            d["limit_pct"] = pct
-
-        d["limit_up"] = (d["pre_close"] * (1 + d["limit_pct"])).round(2)
-        d["limit_down"] = (d["pre_close"] * (1 - d["limit_pct"])).round(2)
-        out = d[["code", "trade_date", "pre_close", "limit_up", "limit_down"]]
+        # 交易所口径：涨跌停价按昨收（除权后参考价）× (1 ± 幅度)，四舍五入到分。
+        # 规则（含 ST 5%、北交所 30%、创业板 2020-08-24 前 10%）统一在
+        # database/limit_rules.py，这里不再自己实现一遍。
+        out = apply_limit_prices(d, code, st_map)
+        out = out[["code", "trade_date", "pre_close", "limit_up", "limit_down"]]
 
         part = DST / f"year={year}"
         part.mkdir(parents=True, exist_ok=True)

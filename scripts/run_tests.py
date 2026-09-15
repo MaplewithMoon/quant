@@ -25,6 +25,8 @@ TESTS = [
     "tests/test_sector_rotation.py",
     "tests/test_fundamental.py",
     "tests/test_joinquant.py",
+    "tests/test_limit_rules.py",
+    "tests/test_data_provenance.py",
 ]
 
 

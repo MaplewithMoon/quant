@@ -255,28 +255,36 @@ def run_validation():
 
 # ============ 重建涨跌停价（仅当年） ============
 def rebuild_limit_year(year):
-    """从清洗层日线计算涨跌停价（主板±10%，创业板/科创板±20%，北交所±30%）"""
+    """从清洗层日线计算涨跌停价
+
+    ⚠️ 两处修正（原先这里是错的，且会覆盖 rebuild_limit.py 生成的正確数据）：
+      1. **用官方 pre_close**，不是 `close.shift(1)`。后者是未除权的昨收，
+         除权除息日算出的涨跌停价会错得离谱（10 送 10 时差一倍）。
+      2. **规则统一到 database/limit_rules.py**：补上 ST ±5% 与北交所
+         43/83/87/88（原先只认 920），并处理创业板 2020-08-24 的制度切换。
+    """
+    from database.limit_rules import apply_limit_prices, load_st_intervals
     src = CLEANED_DAILY / f"year={year}"
     dst = LIMIT_DIR / f"year={year}"
     if not src.exists():
         return
     os.makedirs(dst, exist_ok=True)
+    st_map = load_st_intervals()
+    n = 0
     for f in sorted(src.glob("*.parquet")):
         code = f.stem
         df = pd.read_parquet(f)
-        df = df.sort_values("trade_date").copy()
-        df["pre_close"] = df["close"].shift(1)
-        if code.startswith(("300", "301", "688", "689")):
-            pct = 0.20
-        elif code.startswith("920"):
-            pct = 0.30
-        else:
-            pct = 0.10
-        df["limit_up"] = round(df["pre_close"] * (1 + pct), 2)
-        df["limit_down"] = round(df["pre_close"] * (1 - pct), 2)
-        out = df[["code", "trade_date", "pre_close", "limit_up", "limit_down"]].dropna()
+        if "pre_close" not in df.columns:
+            # 清洗层应带官方 pre_close；缺失就跳过而不是退回 close.shift(1)
+            print(f"  [跳过] {code}: 清洗层缺 pre_close，无法正确计算涨跌停")
+            continue
+        df = df.sort_values("trade_date")
+        out = apply_limit_prices(df, code, st_map)
+        out = out[["code", "trade_date", "pre_close", "limit_up",
+                   "limit_down"]].dropna(subset=["limit_up", "limit_down"])
         out.to_parquet(dst / f"{code}.parquet", index=False)
-    print(f"  涨跌停价 {year}: {len(list(src.glob('*.parquet')))} 文件", flush=True)
+        n += 1
+    print(f"  涨跌停价 {year}: {n} 文件（用官方 pre_close + 统一规则）", flush=True)
 
 
 def main():

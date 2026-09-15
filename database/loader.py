@@ -104,17 +104,14 @@ def load_daily_qfq(code: str, start: str = None, end: str = None) -> pd.DataFram
 
 
 def load_suspend(code: str) -> pd.DataFrame:
-    """读取停牌记录（frozen 层 tushare suspend_d）"""
-    files = list((DB / "frozen" / "suspend").glob(f"year=*/{code}.parquet"))
-    if not files:
-        return pd.DataFrame()
-    dfs = []
-    for f in files:
-        dfs.append(pd.read_parquet(f))
-    df = pd.concat(dfs, ignore_index=True)
-    if "trade_date" in df.columns:
-        df["trade_date"] = pd.to_datetime(df["trade_date"])
-    return df.sort_values("trade_date").reset_index(drop=True)
+    """读取停牌记录（**唯一实现**在 database/status.py）
+
+    只返回 `suspend_type='S'`（停牌日）。'R' 是复牌日，当天可交易，
+    旧实现把它也算成停牌，会在复牌当天错误地禁止交易。
+    """
+    from .status import load_suspensions
+    df = load_suspensions(codes=[str(code).zfill(6)])
+    return df
 
 
 def mark_suspended(daily: pd.DataFrame, code: str) -> pd.DataFrame:

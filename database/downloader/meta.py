@@ -104,22 +104,31 @@ class MetaDownloader(BaseDownloader):
 
     @staticmethod
     def limit_pct(code: str, is_st: bool = False) -> float:
-        if is_st:
-            return 0.05
-        if code.startswith(("300", "301", "688", "689")):
-            return 0.20
-        return 0.10
+        """⚠️ 已废弃：规则统一到 database/limit_rules.py
+
+        旧实现有三处错：缺北交所 30%（920/43/83/87/88）、
+        缺创业板 2020-08-24 前的 ±10%、且 download_code 里用 `close.shift(1)`
+        当昨收（除权日会算错）。保留此方法只为兼容旧调用，内部转调唯一实现。
+        """
+        from database.limit_rules import limit_pct as _lp
+        return _lp(code, None, is_st)
 
     def download_code(self, code: str, daily: pd.DataFrame) -> pd.DataFrame:
+        from database.limit_rules import apply_limit_prices, load_st_intervals
         if daily.empty:
             self.storage.mark_done(code)
             return pd.DataFrame()
         df = daily.sort_values("trade_date").copy()
-        df["pre_close"] = df["close"].shift(1)
-        pct = self.limit_pct(code)
-        df["limit_up"] = round(df["pre_close"] * (1 + pct), 2)
-        df["limit_down"] = round(df["pre_close"] * (1 - pct), 2)
-        out = df[["code", "trade_date", "pre_close", "limit_up", "limit_down"]].dropna()
+        if "pre_close" not in df.columns:
+            # 绝不能退回 close.shift(1)：那是未除权昨收，除权日必错
+            self.logger.error(f"{code}: 缺官方 pre_close，跳过涨跌停计算")
+            return pd.DataFrame()
+        st_map = getattr(self, "_st_map", None)
+        if st_map is None:
+            st_map = self._st_map = load_st_intervals()
+        out = apply_limit_prices(df, code, st_map)
+        out = out[["code", "trade_date", "pre_close", "limit_up",
+                   "limit_down"]].dropna(subset=["limit_up", "limit_down"])
         out["year"] = pd.to_datetime(out["trade_date"]).dt.year
         for y, g in out.groupby("year"):
             if y < self.start_year:

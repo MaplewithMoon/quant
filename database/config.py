@@ -49,6 +49,19 @@ DISK_MIN_FREE = 5 * 1024 ** 3
 # 目标数据起始年份（从新往旧拉取到这一年）
 DATA_START_YEAR = 2005
 
+# ============================================================
+# 非年度数据集的占位分区
+# ============================================================
+# 有些数据集天然不是"按年切片"的（股票列表、ST 名称变更、停牌记录、行业分类、
+# 指数成分、三张报表……），历史上统一塞进 `year=2005` 这个占位分区。
+#
+# ⚠️ 这个约定本身没问题，但**读取方不能按回测区间去拼年份路径**：
+#     用 `year=2024` 去 glob `frozen/suspend` 会拼出一个不存在的路径，
+#     DuckDB 抛 IOException；而调用方往往 `except Exception: 返回空`，
+#     于是**停牌数据在每一次组合回测里都是空的**（本项目中真实发生过）。
+# 统一用 `year_globs()` 生成路径，它会先看磁盘上真实存在哪些分区。
+NON_ANNUAL_YEAR = 2005
+
 
 # ============================================================
 # frozen 层：原始数据集（只读）
@@ -172,6 +185,55 @@ def parquet_glob(path) -> str:
     if any(part.startswith("year=") for part in base.parts):
         return (base / "*.parquet").as_posix()
     return (base / "year=*" / "*.parquet").as_posix()
+
+
+def year_globs(path, y0: int = None, y1: int = None) -> str:
+    """生成 DuckDB `read_parquet()` 用的分区 glob 列表，**只包含磁盘上真实存在的分区**
+
+    为什么不能直接按区间拼路径
+    --------------------------
+    1. **非年度数据集**（stocks / st / suspend / financial / industry / index_cons /
+       dividend / holders …）只有占位分区 `year=2005`。按回测区间去拼会得到
+       `year=2024/*.parquet` —— 不存在，DuckDB 抛 `IOException: No files found`；
+       调用方若用 `except Exception` 吞掉，数据就**静默变空**。
+    2. **年度数据集起始年份可能晚于区间起点**（fund_daily 从 2013、margin 从 2010、
+       northbound 只有 2025+）。缺失的年份同样会让**整条**查询失败，
+       而不是"少几个分区"。
+
+    规则:
+        - 只有占位分区 `year=2005` -> 视为静态数据集，忽略区间，直接用它
+        - 否则 -> 取落在 [y0, y1] 内**且存在**的分区
+        - 区间内一个都没有 -> 回退到全部分区（让 SQL 的日期条件给出空结果，
+          而不是抛异常）
+    """
+    import os
+
+    p = Path(path)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    if any(part.startswith("year=") for part in p.parts):
+        return f"['{(p / '*.parquet').as_posix()}']"
+    if not p.exists():
+        return "[]"
+    years = []
+    for e in os.scandir(p):
+        if e.is_dir() and e.name.startswith("year="):
+            try:
+                years.append(int(e.name[5:]))
+            except ValueError:
+                continue
+    if not years:
+        return "[]"
+    years.sort()
+    if years == [NON_ANNUAL_YEAR]:
+        sel = years                       # 静态数据集，与区间无关
+    else:
+        sel = [y for y in years if (y0 is None or y >= y0)
+               and (y1 is None or y <= y1)]
+        if not sel:
+            sel = years                   # 区间内没有分区 -> 交给 WHERE 过滤
+    return "[" + ", ".join(
+        f"'{(p / f'year={y}' / '*.parquet').as_posix()}'" for y in sel) + "]"
 
 
 def connect_duckdb(db_path=None, threads: int = 4, **kwargs):

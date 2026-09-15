@@ -71,7 +71,9 @@ def load_index_members(index_code: str = "000300.SH") -> pd.DataFrame:
         con.close()
     if df.empty:
         return df
-    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce")
+    # index_cons.trade_date 是 VARCHAR；走统一容错解析（tushare 偶有带时间的格式）
+    from database.dates import parse_tushare_date
+    df["trade_date"] = parse_tushare_date(df["trade_date"])
     df = df.dropna(subset=["trade_date"])
     # 'con_code' 形如 300750.SZ -> 提取 6 位代码
     df["code"] = df["con_code"].astype(str).str.split(".").str[0]
@@ -135,64 +137,37 @@ def index_weight_panel(index_code: str, dates: pd.DatetimeIndex,
 def st_panel(dates: pd.DatetimeIndex, codes) -> pd.DataFrame:
     """ST 状态掩码（宽表 bool）：该日该股是否处于 ST/*ST 状态
 
-    数据来源 frozen/st（tushare namechange），每条记录给出一个名称生效区间
-    [start_date, end_date]；名称含 ST 的区间即为风险警示期。
+    转调 `database/limit_rules.py` 的**唯一** ST 区间实现（涨跌停价也用同一份）。
+    旧实现自己写了一遍，并且 `except Exception: df = pd.DataFrame()` 静默吞错 ——
+    一旦读取失败就返回全 False，**ST 股会被当成正常股留在股票池里**。
+    现在数据集存在却解析不出内容时直接抛错。
     """
-    from database.config import connect_duckdb
-    glob = f"{FROZEN_ROOT.as_posix()}/st/year=*/*.parquet"
-    con = connect_duckdb()
-    try:
-        df = con.execute(f"""
-            SELECT code, name, start_date, end_date
-            FROM read_parquet('{glob}')
-            WHERE upper(name) LIKE '%ST%'
-        """).fetchdf()
-    except Exception:
-        df = pd.DataFrame()
-    finally:
-        con.close()
+    from database.limit_rules import ST_DIR_DEFAULT, load_st_intervals, st_mask
 
-    mask = pd.DataFrame(False, index=dates, columns=list(codes))
-    if df.empty:
+    idx = pd.DatetimeIndex(dates)
+    cols = [str(c).zfill(6) for c in codes]
+    mask = pd.DataFrame(False, index=idx, columns=cols)
+    if not ST_DIR_DEFAULT.exists():
+        print("  [警告] frozen/st 不存在，ST 过滤无法生效")
         return mask
-
-    df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
-    df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce")
-    df = df.dropna(subset=["start_date"])
-    idx = mask.index
-    for code, g in df.groupby("code"):
-        if code not in mask.columns:
-            continue
-        col = pd.Series(False, index=idx)
-        for _, r in g.iterrows():
-            end = r["end_date"] if pd.notna(r["end_date"]) else idx[-1]
-            col |= (idx >= r["start_date"]) & (idx <= end)
-        mask[code] = col
+    st_map = load_st_intervals()
+    if not st_map:
+        raise RuntimeError("frozen/st 存在但未解析出任何 ST 区间 —— "
+                           "拒绝静默返回全 False（会让 ST 股进入股票池）")
+    for code in cols:
+        if st_map.get(code):
+            mask[code] = st_mask(idx, code, st_map)
     return mask
 
 
 def suspended_panel(dates: pd.DatetimeIndex, codes) -> pd.DataFrame:
-    """停牌掩码（宽表 bool）"""
-    from database.config import connect_duckdb
-    glob = f"{FROZEN_ROOT.as_posix()}/suspend/year=*/*.parquet"
-    con = connect_duckdb()
-    try:
-        df = con.execute(f"""
-            SELECT code, trade_date FROM read_parquet('{glob}')
-        """).fetchdf()
-    except Exception:
-        df = pd.DataFrame()
-    finally:
-        con.close()
+    """停牌掩码（宽表 bool）—— 转调唯一实现 database/status.py
 
-    if df.empty:
-        return pd.DataFrame(False, index=dates, columns=list(codes))
-    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
-    df = df.dropna(subset=["trade_date"])
-    df = df[df["code"].isin(list(codes))]
-    sus = df.assign(_v=True).pivot_table(index="trade_date", columns="code",
-                                         values="_v", aggfunc="first")
-    return sus.reindex(index=dates, columns=list(codes)).fillna(False).astype(bool)
+    旧实现自己写了一遍，而且把 `suspend_type='R'`（**复牌日**，当天可交易）
+    也当成停牌，会在复牌当天错误地把股票排除出股票池。
+    """
+    from database.status import suspended_wide
+    return suspended_wide(dates, codes)
 
 
 # ============================================================

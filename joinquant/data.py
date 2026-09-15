@@ -236,8 +236,9 @@ class JQData:
             self._fin_dates = np.array([], dtype="datetime64[ns]")
             return
         df["code"] = df["code"].astype(str).str.zfill(6)
-        df["ann_date"] = pd.to_datetime(df["ann_date"], format="%Y%m%d", errors="coerce")
-        df["end_date"] = pd.to_datetime(df["end_date"], format="%Y%m%d", errors="coerce")
+        from database.dates import parse_tushare_date
+        df["ann_date"] = parse_tushare_date(df["ann_date"])
+        df["end_date"] = parse_tushare_date(df["end_date"])
         df = df.dropna(subset=["ann_date", "end_date"])
         df = (df.sort_values(["code", "end_date", "ann_date"])
                 .drop_duplicates(["code", "end_date"], keep="first"))
@@ -455,8 +456,9 @@ class JQData:
                 if pd.api.types.is_datetime64_any_dtype(s):
                     s = pd.to_datetime(s, errors="coerce")
                 else:
-                    s = pd.to_datetime(s.astype(str), format="%Y%m%d",
-                                       errors="coerce")
+                    # 走统一容错解析：VARCHAR 列里可能混着 'YYYY-MM-DD HH:MM:SS'
+                    from database.dates import parse_tushare_date
+                    s = parse_tushare_date(s)
                 if "is_open" in df.columns:
                     s = s[pd.to_numeric(df["is_open"], errors="coerce") == 1]
                 s = s.dropna().drop_duplicates().sort_values()

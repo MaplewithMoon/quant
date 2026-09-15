@@ -24,10 +24,13 @@ from database.config import FROZEN_ROOT, dir_of
 def _glob(path, y0: int, y1: int) -> str:
     """生成只覆盖所需年份的 parquet 路径列表（DuckDB 的 read_parquet 接受列表）
 
-    注意：DuckDB 不支持 `{2022,2023}` 这种花括号展开，必须显式给列表。
+    注意：DuckDB 不支持 `{2022,2023}` 这种花括号展开，必须显式给列表；
+    而且**只能列真实存在的分区** —— 数据集起始年份可能晚于区间起点
+    （fund_daily 从 2013、margin 从 2010），列了不存在的年份会让整条查询
+    抛 `IOException`，而不是"少几个分区"。统一走 database.config.year_globs()。
     """
-    parts = [f"'{path.as_posix()}/year={y}/*.parquet'" for y in range(y0, y1 + 1)]
-    return "[" + ", ".join(parts) + "]"
+    from database.config import year_globs
+    return year_globs(path, y0, y1)
 
 
 def load_panel(start: str, end: str, codes: list = None,

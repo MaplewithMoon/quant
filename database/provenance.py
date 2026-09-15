@@ -61,6 +61,79 @@ def stamp_dataset(dataset: str, meta: dict) -> Path:
 
 
 # ============================================================
+# 数据指纹：判断"数据是否变过"，用于让派生缓存正确失效
+# ============================================================
+# 面板缓存（.cache/panel/<start>_<end>/）原先只以**区间**为键。数据被重建之后
+# 缓存仍然命中，于是回测拿着旧数据算出结论 —— 这是一条会静默污染全部研究结论的
+# 路径（本项目刚修完涨跌停价，就有 115 万行被改写，所有 2017–2020 的回测都受影响）。
+# 因此缓存元数据里必须记下**所依赖数据集的指纹**，指纹变了就拒绝复用。
+PANEL_DEPS = ("daily", "valuation", "adjust", "limit", "suspend")
+
+
+def _fingerprint_one(dataset: str) -> dict:
+    """单个数据集的指纹：文件数 + 最新 mtime + 生成时间戳
+
+    用 os.scandir 逐层扫描（比 Path.glob 少建大量 Path 对象），
+    7 万文件的数据集约 3 秒 —— 相对面板加载的 8 分钟可以忽略。
+    """
+    import os
+
+    d = dir_of(dataset)
+    if not d.exists():
+        return {"exists": False}
+    n = 0
+    newest = 0.0
+    try:
+        years = [e for e in os.scandir(d) if e.is_dir() and e.name.startswith("year=")]
+    except OSError:
+        return {"exists": False}
+    for y in years:
+        try:
+            for f in os.scandir(y.path):
+                if not f.name.endswith(".parquet"):
+                    continue
+                n += 1
+                try:
+                    m = f.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest:
+                    newest = m
+        except OSError:
+            continue
+    return {
+        "exists": True,
+        "n_files": n,
+        "max_mtime": round(newest, 3),
+        "generated": get_stamp(dataset).get("generation_timestamp"),
+    }
+
+
+def dataset_fingerprint(datasets=None) -> dict:
+    """一组数据集的指纹（默认面板所依赖的全部数据集）
+
+    只要任一数据集的文件数 / 最新修改时间 / 生成时间戳变了，指纹就变。
+    比对时只比 `max_mtime` 与 `n_files`，`generated` 仅作展示。
+    """
+    return {ds: _fingerprint_one(ds) for ds in (datasets or PANEL_DEPS)}
+
+
+def fingerprint_changed(old: dict, new: dict) -> list:
+    """比较两个指纹，返回**发生变化的数据集名**列表（空 = 未变）"""
+    changed = []
+    for ds, cur in (new or {}).items():
+        prev = (old or {}).get(ds)
+        if prev is None:
+            changed.append(ds)
+            continue
+        if (prev.get("n_files") != cur.get("n_files")
+                or prev.get("max_mtime") != cur.get("max_mtime")):
+            changed.append(ds)
+    return changed
+
+
+
+# ============================================================
 # 数据可获得日期（availability）
 # ============================================================
 def attach_availability(df, trade_date_col="trade_date",
