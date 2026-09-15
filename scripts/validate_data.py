@@ -205,9 +205,64 @@ def check_coverage(quick=True, sample_days=10, sample_stocks=30):
     per_code["min_d"] = pd.to_datetime(per_code["min_d"])
     per_code["max_d"] = pd.to_datetime(per_code["max_d"])
     have = set(per_code["code"])
+    # 每个 (code, year) 的交易日范围 —— 用于识别**连续停牌段**并把它从分母里剔除。
+    # 【为什么】长期停牌股（000757 停 5 年、000670 从 2020-03 停到 2022-08、
+    # 000638 在 2016~2017 跨年停牌 …）的覆盖率天然只有 56%~80%，
+    # 把它们全报成"问题"会让门禁永久变红。
+    # 【判据】与 check_year_completeness 用同一套两类证据：
+    #   ① 与"整年没有数据"相连的交易日（跨年中途停牌/复牌就是这个形状）
+    #   ② `frozen/suspend` 里 `suspend_type='S'` 覆盖的交易日
+    # 整年缺口本身仍由 check_year_completeness 另行证据化把关。
+    pc_year = con.execute(f"""
+        SELECT code, year(trade_date) y, min(trade_date) a, max(trade_date) b
+        FROM read_parquet('{DAILY_ALL_GLOB}') GROUP BY 1, 2
+    """).fetchdf()
+    yspan = {}
+    for r in pc_year.itertuples(index=False):
+        yspan.setdefault(r.code, {})[int(r.y)] = (pd.Timestamp(r.a), pd.Timestamp(r.b))
+    # 证据②：停牌记录（只取 S）
+    sus_by_code = {}
+    sus_dir = FROZEN_ROOT / "suspend"
+    if sus_dir.exists():
+        sg = (sus_dir / "year=2005" / "*.parquet").as_posix()
+        sd = con.execute(f"""
+            SELECT code, strptime(trade_date, '%Y%m%d')::DATE d
+            FROM read_parquet('{sg}') WHERE suspend_type = 'S'
+        """).fetchdf()
+        for r in sd.itertuples(index=False):
+            sus_by_code.setdefault(str(r.code).zfill(6), set()).add(pd.Timestamp(r.d))
+    con.close()
+    cal_idx = pd.DatetimeIndex(sorted(cal_days))
+
+    def _explained_days(code, lo, hi, full):
+        """[lo, hi] 内属于"停牌段"的交易日数（两类证据取并集，不重复计）"""
+        exp = set()
+        # 证据①：与整年缺失相连的区间
+        ys = yspan.get(code)
+        if ys:
+            for y in sorted(ys):
+                if (y + 1) in ys:
+                    continue
+                end_y = y
+                while (end_y + 1) not in ys and (end_y + 1) <= hi.year:
+                    end_y += 1
+                s = ys[y][1] + pd.Timedelta(days=1)
+                nxt = ys.get(end_y + 1)
+                e = nxt[0] - pd.Timedelta(days=1) if nxt else hi
+                s, e = max(s, lo), min(e, hi)
+                if s <= e:
+                    i0 = cal_idx.searchsorted(s, "left")
+                    i1 = cal_idx.searchsorted(e, "right")
+                    exp.update(cal_idx[i0:i1])
+        # 证据②：停牌记录
+        sd = sus_by_code.get(code)
+        if sd:
+            exp |= (sd & set(full))
+        return len(exp)
 
     stock_issues = 0
     checked = 0
+    skipped_long_halt = []
     for ci, code in enumerate(all_codes):
         srow = stocks[stocks["code"].astype(str) == code]
         if srow.empty:
@@ -225,16 +280,30 @@ def check_coverage(quick=True, sample_days=10, sample_stocks=30):
             continue
         row = per_code[per_code["code"] == code].iloc[0]
         actual = int(row["actual"])
-        # 数据按设计从 2005 年起，期望天数从 max(上市日, 2005) 算到数据末日
-        start_day = max(lst, pd.Timestamp("2005-01-01"))
-        expected_days = sum(1 for c in cal_days if start_day <= c <= row["max_d"])
+        # 分母 = [max(上市日, 2005), 数据末日] ∩ [该股**实际数据起点**, 末日]。
+        # 【为什么从实际起点算】`000638`(*ST万方) 的 list_date 是 1996，
+        # 但它在 2005~2009 是**暂停上市**、数据自然从 2009-06-05 才开始；
+        # 若从 2005 起算就会凭空多出 971 个"缺失日"。**开头/结尾的整段缺失
+        # 属于"整年缺口"**，已由 check_year_completeness 用证据化判据把关；
+        # 这里只负责抓**区间内部**的部分缺失。职责分开，避免两处都报同一件事。
+        start_day = max(lst, pd.Timestamp("2005-01-01"), row["min_d"])
+        full = [c for c in cal_days if start_day <= c <= row["max_d"]]
+        exp_gap = _explained_days(code, start_day, row["max_d"], full)
+        expected_days = len(full) - exp_gap
+        if exp_gap:
+            skipped_long_halt.append((code, exp_gap))
         ratio = actual / expected_days if expected_days else 0
         if ratio < 0.8:
-            report(f"{code} 覆盖率", False, f"{actual}/{expected_days} 天 ({ratio:.0%})")
+            report(f"{code} 覆盖率", False,
+                   f"{actual}/{expected_days} 天 ({ratio:.0%}，已扣停牌段 {exp_gap})")
             stock_issues += 1
         if (ci + 1) % 1000 == 0:
             log(f"  逐股进度 {ci+1}/{len(all_codes)}")
-    report("逐股覆盖率(全量)", stock_issues == 0, f"问题 {stock_issues}" if stock_issues else f"全量检查 {checked} 只正常")
+    if skipped_long_halt:
+        log(f"  有长期停牌历史、已从分母剔除相应交易日的股票: {len(skipped_long_halt)} 只"
+            f"（整年缺口由 --check completeness 证据化判定）")
+    report("逐股覆盖率(全量)", stock_issues == 0,
+           f"问题 {stock_issues}" if stock_issues else f"全量检查 {checked} 只正常")
 
 # ============================================================
 # 4. 涨跌停价规则一致性（2026-09 新增）
