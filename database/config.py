@@ -265,8 +265,39 @@ def connect_duckdb(db_path=None, threads: int = 4, **kwargs):
     return con
 
 
+def write_manifest() -> Path:
+    """把 `db/_MANIFEST.json` **从本文件生成**（不要手写）
+
+    原先这个文件是手写的一次性说明，既没有生成方也没有读取方，内容很快就和
+    `RECIPES` 漂移了 —— 它的 `limit_price.rules` 还停在"主板±10%/创业板±20%/
+    ST±5%"，缺少创业板 2020-08-24 前 ±10%、上市初期规则、ST 只对主板生效等
+    三条；`producer` 也和 `RECIPES` 不一致。读到它的人会拿到**错的规则**。
+    改成生成之后就不可能再漂移。
+    """
+    import json
+    from datetime import datetime
+    manifest = {
+        "generated_by": "database/config.py::write_manifest()",
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "warning": "本文件由代码生成，请勿手改；要改规则请改 database/config.py",
+        "layer_rules": {
+            "frozen": "只读原始层：数据源原样落盘，仅下载器可写（Storage allow_frozen=True）",
+            "cleaned": "加工层：可从 frozen 重建，按清洗配方分子目录",
+            "_legacy": "历史产物（frozen 层建立之前的旧管线），只归档不再更新，可安全删除",
+        },
+        "frozen_datasets": FROZEN_DATASETS,
+        "cleaned_recipes": RECIPES,
+        "dataset_to_recipe": DATASET_TO_RECIPE,
+        "non_annual_year": NON_ANNUAL_YEAR,
+    }
+    path = DB_ROOT / "_MANIFEST.json"
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return path
+
+
 def setup_database():
-    """创建数据库目录结构"""
+    """创建数据库目录结构（并把 _MANIFEST.json 从本文件重新生成）"""
     DB_ROOT.mkdir(parents=True, exist_ok=True)
     FROZEN_ROOT.mkdir(parents=True, exist_ok=True)
     CLEANED_ROOT.mkdir(parents=True, exist_ok=True)
@@ -275,4 +306,5 @@ def setup_database():
         frozen_dir(name).mkdir(parents=True, exist_ok=True)
     for name in RECIPES:
         recipe_dir(name).mkdir(parents=True, exist_ok=True)
+    write_manifest()
     return DB_ROOT

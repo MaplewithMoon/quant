@@ -437,9 +437,12 @@ class JQData:
     def _load_calendar(self):
         """交易所交易日历（frozen/calendar）
 
-        聚宽的 get_trade_days 走的是**交易所日历**，覆盖范围比我们加载的面板长。
-        只用面板日期会让"下个月第一个交易日"在回测末期取不到 → 策略拿空列表
-        去索引 [0] → IndexError（v2 实测 2 次）。
+        ⚠️ **已不再被 `trade_days()` 使用（2026-09 审计确认无调用方）**。
+        保留只为兼容历史代码。要理解为什么不能用它，见 `trade_days()` 的说明：
+        `frozen/calendar` 覆盖到 **2027**（含未来占位日），比面板长 486 天，
+        策略据此算出的调仓日引擎跑不到，会卡死状态机。
+
+        另外它把 38 个分区 `pd.concat` 起来逐文件读 —— 比 DuckDB 慢一个量级。
         """
         from database.config import FROZEN_ROOT
         fs = sorted((FROZEN_ROOT / "calendar").rglob("*.parquet"))

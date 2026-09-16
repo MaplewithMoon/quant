@@ -18,7 +18,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from database.config import FROZEN_ROOT, connect_duckdb, dir_of, parquet_glob
+from database.config import (CLEANED_ROOT, FROZEN_ROOT, connect_duckdb, dir_of,
+                             parquet_glob)
 
 DB = Path("db")
 DAILY_DIR = dir_of("daily")                  # db/cleaned/daily_basic
@@ -81,9 +82,15 @@ SCHEMA_SPECS = {
               "numeric": ["open", "high", "low", "close", "volume", "amount"],
               "units": {"volume": ("股", 0, 1e12), "amount": ("元", 0, 1e14),
                         "open": ("元", 0, 1e5), "close": ("元", 0, 1e5)}},
-    "valuation": {"required": ["code", "trade_date", "pe_ttm", "pb", "total_mv"],
+    "valuation": {"required": ["code", "trade_date", "pe_ttm", "pb", "total_mv",
+                               "turnover_rate"],
                   "numeric": ["pe_ttm", "pb", "ps_ttm", "total_mv", "circ_mv", "turnover_rate"],
-                  "units": {"total_mv": ("万元", 0, 1e11), "turnover_rate": ("%", 0, 1e3)}},
+                  # ⚠️ 只设上界抓不到"亿元污染"（亿元数值**更小**，会照样通过）。
+                  # 所以额外给 total_mv 一个**中位数下界**：A 股总市值中位数约
+                  # 50 亿元 = 5e5 万元；若被误按亿元写入，中位数会掉到 ~50，
+                  # 差 4 个数量级，用中位数判定极稳。
+                  "units": {"total_mv": ("万元", 0, 1e11), "turnover_rate": ("%", 0, 1e3)},
+                  "median_min": {"total_mv": 1e4, "turnover_rate": 0.01}},
     "adjust": {"required": ["code", "trade_date", "adj_factor"],
                "numeric": ["adj_factor"]},
 }
@@ -109,7 +116,17 @@ def check_schema(dataset: str, quick=False):
         report(f"{dataset} 列一致性", False, f"读取失败(可能存在schema不一致文件): {str(e)[:60]}")
         issues += 1
 
-    # 2) 数值列类型 + 单位范围（全量扫描）
+    # 2) 必填列**逐列**做一次 count —— `count(*)` 不会碰列，
+    #    所以只要不显式引用，某些文件缺列也不报错；显式 count 才会抛
+    #    schema mismatch。这是抓"第二个写入方用了不同的列集"的关键。
+    for c in spec.get("required", []):
+        try:
+            con.execute(f"SELECT count({c}) FROM read_parquet('{glob_pat}')").fetchone()
+        except Exception as e:
+            report(f"{dataset}.{c} 列存在性", False, f"{str(e)[:70]}")
+            issues += 1
+
+    # 3) 数值列类型 + 单位范围（全量扫描）
     for c, (unit, lo, hi) in spec.get("units", {}).items():
         try:
             cnt = con.execute(f"""
@@ -121,7 +138,107 @@ def check_schema(dataset: str, quick=False):
                 issues += 1
         except Exception as e:
             log(f"  {dataset}.{c} 检查跳过: {str(e)[:50]}")
+
+    # 4) 中位数下界：抓"单位被整体缩小"这类污染
+    #    （上界检查对它无效 —— 亿元数值更小，照样落在 [lo, hi] 内）
+    for c, floor in spec.get("median_min", {}).items():
+        try:
+            med = con.execute(f"""
+                SELECT median({c}) FROM read_parquet('{glob_pat}') WHERE {c} IS NOT NULL
+            """).fetchone()[0]
+            if med is None:
+                continue
+            ok = float(med) >= floor
+            report(f"{dataset}.{c} 中位数合理（单位未错）", ok,
+                   f"中位数 {float(med):,.2f}，下界 {floor:,.0f}" +
+                   ("" if ok else " —— 偏低，单位可能被整体换算过"))
+        except Exception as e:
+            log(f"  {dataset}.{c} 中位数检查跳过: {str(e)[:50]}")
     report(f"{dataset} Schema", issues == 0, f"问题 {issues}" if issues else f"全量 {len(files)} 文件通过")
+
+
+# ============================================================
+# 2b. 列一致性（按文件名采样，2026-09 新增）
+# ============================================================
+# **已声明**的多列集数据集：分裂是设计使然，且读取方都按文件名区分。
+# 不在这个白名单里的分裂一律算问题 —— 这样新出现的意外分裂
+# （例如某个下载器用不同列集写了同一目录）仍然会被抓到。
+MULTI_SCHEMA_DECLARED = {
+    "financial": "同一目录下按前缀分三张报表（balance_/profit_/cashflow_），列数本就不同",
+    "industry": "stock_industry（个股行业归属）与 sw_l1（申万一级清单）是两张不同的表",
+    "stocks": "all（tushare 当前列表）与 data（旧管线产物）是两种 schema",
+}
+
+
+def check_column_consistency():
+    """逐数据集检查：**同一目录下的文件是否列名一致**
+
+    为什么单独做这一条
+    ------------------
+    `count(*)` 不引用任何列，所以**缺列的文件不会让查询失败** —— 于是
+    "第二个写入方用了不同的列集"能长期潜伏。本项目已经踩过两次：
+      - `frozen/stocks/` 里 `all.parquet`（含 list_date）与 `data.parquet`
+        （旧管线，只有 list_status）并存，选 `ts_code` 直接抛 schema mismatch
+      - `frozen/industry/` 里 `sw_l1` 与 `stock_industry` 完全不同
+    另外 `database/downloader/valuation.py` 曾经把市值换算成亿元、列名改成
+    `turnover`，写进**同一个** `frozen/valuation`（已修）。
+
+    只比**列名**、不比类型：DuckDB 能自动统一 INTEGER/DOUBLE，
+    `frozen/financial`/`dividend` 逐文件类型不同是正常的，比类型会全是假阳性。
+    """
+    import os
+    import re
+    print("\n[列一致性] 同一数据集内不同文件的列名是否一致")
+    con = connect_duckdb()
+    bad = []
+    checked = 0
+    for root, label in ((FROZEN_ROOT, "frozen"), (CLEANED_ROOT, "cleaned")):
+        if not root.exists():
+            continue
+        for ds in sorted(os.listdir(root)):
+            p = root / ds
+            if not p.is_dir():
+                continue
+            by_name = {}
+            for f in p.glob("year=*/*.parquet"):
+                by_name.setdefault(f.name, f)
+            if not by_name:
+                continue
+            # 【抽样】逐文件 DESCRIBE 在 daily_basic 上有 5,500 个不同文件名，
+            # 全量要十几分钟。这里取：**所有"非 6 位股票代码"的特殊文件名**
+            # （第二次写入方产生的正是这类：all/data、sw_l1/stock_industry）
+            # + 均匀抽取 30 个股票代码文件。
+            names = sorted(by_name)
+            special = [n for n in names if not re.fullmatch(r"\d{6}\.parquet", n)]
+            plain = [n for n in names if re.fullmatch(r"\d{6}\.parquet", n)]
+            step = max(1, len(plain) // 30)
+            pick = special + plain[::step][:30]
+            sigs = {}
+            for name in pick:
+                f = by_name[name]
+                try:
+                    cols = con.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet('{f.as_posix()}')").fetchdf()
+                    sig = tuple(sorted(cols["column_name"]))
+                except Exception as e:
+                    sig = (f"<读取失败 {type(e).__name__}>",)
+                sigs.setdefault(sig, []).append(name)
+            checked += 1
+            if len(sigs) > 1:
+                detail = " | ".join(
+                    f"{len(v)} 文件({', '.join(v[:2])}…) 列数 {len(k)}"
+                    for k, v in sorted(sigs.items(), key=lambda kv: -len(kv[1])))
+                if ds in MULTI_SCHEMA_DECLARED:
+                    log(f"    ℹ {label}/{ds} 有 {len(sigs)} 种列集（已声明："
+                        f"{MULTI_SCHEMA_DECLARED[ds]}）")
+                else:
+                    bad.append(f"{label}/{ds}: {len(sigs)} 种列集 -> {detail}")
+    con.close()
+    for b in bad:
+        log(f"    ⚠ {b}")
+    report(f"各数据集列名一致（查了 {checked} 个）", not bad,
+           f"{len(bad)} 个数据集出现**未声明**的列集分裂" if bad else
+           f"{checked} 个数据集均一致（{len(MULTI_SCHEMA_DECLARED)} 个已声明的分裂）")
 
 # ============================================================
 # 3. 覆盖率检查
@@ -855,6 +972,7 @@ def main():
     if "schema" in wanted:
         for ds in ["daily", "frozen/valuation", "frozen/adjust"]:
             check_schema(ds, quick=args.quick)
+        check_column_consistency()
     if "coverage" in wanted:
         check_coverage(quick=args.quick)
     if "limit" in wanted:

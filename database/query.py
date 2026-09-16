@@ -1,4 +1,18 @@
-"""DuckDB 查询层：直接对 Parquet 分区做 SQL 查询"""
+"""DuckDB 查询层：直接对 Parquet 分区做 SQL 查询
+
+⚠️ **本模块目前没有任何调用方（2026-09 审计确认）**，保留仅为兼容历史代码。
+
+    新代码请直接用 `database.config.connect_duckdb()` +
+    `read_parquet(year_globs(...))`，不要用这里的方法，原因：
+      1. 它自己 `duckdb.connect()`，没有 `SET enable_progress_bar=false`，
+         扫 parquet 时会把进度条刷进 stderr（`connect_duckdb()` 就是为此存在）
+      2. `create_views()` 用 `read_parquet('{root}/**/*.parquet')` 全目录递归，
+         对 `frozen/stocks`、`frozen/industry` 这类**同目录多 schema** 的数据集
+         会直接抛 schema mismatch；而它用 `except Exception: continue` 吞掉，
+         结果是"视图建了但没建全"且不报错
+      3. `query_files()` 拼 SQL 字符串，`where` 参数未做转义
+
+"""
 import duckdb
 import pandas as pd
 from .config import DB_DUCKDB
