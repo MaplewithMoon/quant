@@ -43,20 +43,167 @@ GEM_PREFIXES = ("300", "301")           # 创业板
 # 创业板注册制改革：2020-08-24 起涨跌幅由 ±10% 放宽到 ±20%
 GEM_20PCT_FROM = pd.Timestamp("2020-08-24")
 
-# 新股上市初期不设涨跌幅（注册制）：科创板/创业板/主板(2023-04-10 起) 前 5 个
-# 交易日、北交所首日。
+# 主板 ST 的 ±5% 自 2026-07-06 起放宽到 ±10%
 #
-# ⚠️ **尚未实现**。这个常量只是把规则写在显眼处，避免误以为已经生效。
-#    实测影响 29,289 行（占全库 0.183%），集中在次新股前 5 日。
-#    实现路径已经验证过：`MarketRules` 的 `_num()` 对 NaN 返回 None 会**跳过**
-#    涨跌停检查，所以把窗口内的 `limit_up/limit_down` 置为 NaN 即可表达"无限制"。
-#    需要改的调用点：`apply_limit_prices` 增加 `list_date` 参数，并把
-#    `rebuild_limit.py` / `daily_update.py` / `meta.py` / `validate_data.py`
-#    四处都传进去（否则校验会误报不一致）。
-#    分板块生效日：科创板 2019-07-22、创业板 2020-08-24、北交所 2021-11-15、
-#    主板 2023-04-10。主板 2014-01-01 ~ 2023-04-09 的首日 ±44% 是另一条规则
-#    （基准是发行价而非昨收），未在本模块处理。
+# 【这个日期是**从行情数据反推**出来的，不是抄某份公告】
+#   2026-07-03 及之前：主板 ST 股每日 |pct_chg| 上限稳定在 5.11%~5.19%（141 只样本）
+#   2026-07-06 起    ：上限跳到 10.08%~10.26%，并开始出现"最高价越过涨停价"的行
+#   2015-2025 全年   ：超 5.5% 的行数为 0
+# 断点非常干净，所以按制度变更处理。若日后拿到正式公告，核对/修正这里即可。
+MAIN_ST_10PCT_FROM = pd.Timestamp("2026-07-06")
+
+# ============================================================
+# 上市初期的特殊涨跌幅规则
+# ============================================================
+# A 股对新股上市初期的涨跌幅有**独立于板块常规档位**的规定，而且随制度
+# 改革反复变化。不建模会有两种方向的错：
+#   - 该"不设限"却按常规档位算 -> 涨停价偏低 -> **多拦**买入（次新股首日的
+#     合法大涨会被当成封板）
+#   - 该 ±44% 却按 ±10% 算 -> 同样多拦
+#
+# 规则表按"板块 × 上市日所在制度区间"组织。规则类型：
+#   NO_LIMIT  : 上市后前 n 个**市场交易日**不设涨跌幅 -> limit 置 NaN
+#               （`MarketRules._num()` 对 NaN 返回 None -> 跳过涨跌停检查）
+#   FIRST_44  : 上市首日有效申报价格 ≤ 发行价×1.44、≥×0.64
+#               （2013-12-13《新股发行体制改革意见》起，沪深主板）
+#               tushare 首日 `pre_close` 正是**发行价** —— 已用 002973/002971/
+#               603551/603290 等实测确认（首日 high/pre_close−1 = 0.4399~0.4408）
+#   None      : 无特殊规则，走板块常规档位
+NO_LIMIT = "no_limit"
+FIRST_44 = "first_44"
+
+# 首日 ±44% 的整数因子：**不是对称的 ±44%**，跌的方向只有 −36%
+K44_UP = 14400          # ×1.44
+K44_DN = 6400           # ×0.64
+
+LISTING_REGIMES = {
+    # 主板：1990~2013-12-12 首日不设限；2013-12-13~2023-04-09 首日 ±44%；
+    #       2023-04-10（全面注册制首批）起前 5 个交易日不设限
+    "MAIN": (("1990-01-01", NO_LIMIT, 1),
+             ("2013-12-13", FIRST_44, 0),
+             ("2023-04-10", NO_LIMIT, 5)),
+    # 创业板：2009-10-30 开板起首日不设限；2020-08-24 注册制改革起前 5 日不设限
+    "GEM": (("2009-10-30", NO_LIMIT, 1),
+            ("2020-08-24", NO_LIMIT, 5)),
+    # 科创板：2019-07-22 开板起前 5 个交易日不设限
+    "STAR": (("2019-07-22", NO_LIMIT, 5),),
+    # 北交所：2020-07-27 精选层设立起首日不设限；2021-11-15 开市后同样首日不设限
+    "BSE": (("2020-07-27", NO_LIMIT, 1),),
+}
+
+# 兼容旧名（外部可能引用）
 NO_LIMIT_DAYS = 5
+
+
+def board_of(code: str) -> str:
+    """板块标识：STAR / GEM / BSE / MAIN"""
+    c = str(code).zfill(6)
+    if c.startswith(STAR_PREFIXES):
+        return "STAR"
+    if c.startswith(GEM_PREFIXES):
+        return "GEM"
+    if c.startswith(BEIJING_PREFIXES):
+        return "BSE"
+    return "MAIN"
+
+
+def listing_rule(code: str, list_date) -> Tuple[Optional[str], int]:
+    """该股适用的上市初期规则 -> (kind, n)；无特殊规则返回 (None, 0)"""
+    if list_date is None or pd.isna(list_date):
+        return (None, 0)
+    d = pd.Timestamp(list_date)
+    kind, n = None, 0
+    for eff, k, cnt in LISTING_REGIMES.get(board_of(code), ()):
+        if d >= pd.Timestamp(eff):
+            kind, n = k, cnt
+    return (kind, n)
+
+
+_CAL_CACHE: Dict[str, object] = {}
+
+
+def trading_calendar() -> pd.DatetimeIndex:
+    """全市场交易日（frozen/calendar；该表只存开市日，仍按 is_open 过滤防御）"""
+    if "cal" in _CAL_CACHE:
+        return _CAL_CACHE["cal"]
+    from database.config import FROZEN_ROOT, connect_duckdb, year_globs
+    cal = pd.DatetimeIndex([])
+    d = FROZEN_ROOT / "calendar"
+    if d.exists():
+        g = year_globs(d)
+        if g != "[]":
+            con = connect_duckdb()
+            try:
+                df = con.execute(f"""
+                    SELECT DISTINCT trade_date FROM read_parquet({g})
+                    WHERE try_cast(is_open AS INTEGER) IS NULL
+                       OR try_cast(is_open AS INTEGER) = 1
+                    ORDER BY 1
+                """).fetchdf()
+                cal = pd.DatetimeIndex(pd.to_datetime(df["trade_date"]))
+            finally:
+                con.close()
+    _CAL_CACHE["cal"] = cal
+    return cal
+
+
+def load_list_dates() -> Dict[str, pd.Timestamp]:
+    """{code: 上市日} —— 取 frozen/stocks 的 all.parquet
+
+    ⚠️ 该目录下还有一份旧管线产物 `data.parquet`（code/name/list_status），
+    两者 schema 不同，用 `year=*/*.parquet` 一把捞会因缺列抛 schema mismatch。
+    """
+    from database.config import FROZEN_ROOT, connect_duckdb
+    f = FROZEN_ROOT / "stocks" / "year=2005" / "all.parquet"
+    if not f.exists():
+        return {}
+    con = connect_duckdb()
+    try:
+        df = con.execute(f"SELECT code, list_date FROM "
+                         f"read_parquet('{f.as_posix()}')").fetchdf()
+    finally:
+        con.close()
+    out = {}
+    for r in df.itertuples(index=False):
+        d = pd.to_datetime(r.list_date, errors="coerce")
+        if pd.notna(d):
+            out[str(r.code).zfill(6)] = pd.Timestamp(d)
+    return out
+
+
+def listing_windows(list_dates: Dict[str, pd.Timestamp] = None,
+                    cal: pd.DatetimeIndex = None) -> Dict[str, Tuple[str, pd.Timestamp, pd.Timestamp, int]]:
+    """{code: (kind, start, until, n)} —— 上市初期特殊规则的**生效区间**
+
+    区间含义：
+        NO_LIMIT  -> [start, until] 内不设涨跌幅（limit 置空）
+        FIRST_44  -> [start, until] 内适用 ×1.44/×0.64（首日，start == until）
+    区间按**市场交易日**数：即"上市后的前 n 个交易日"，停牌不顺延。
+
+    ⚠️ **必须同时判上下界**。只判 `trade_date <= until` 会把"数据起点早于
+    list_date"的股票（重新上市股，如 `601399 国机重装` 的日线早于其重上市日）
+    的**整段历史**都算进窗口 —— 实测会多出 6 万行错误的空涨跌停价。
+
+    ⚠️ 已知局限：窗口起点取自 `frozen/stocks.list_date`。对于重新上市股，
+    tushare 的 list_date 是重上市日、且这类股票不适用新股首日规则，会被误套
+    ±44%。区分它们需要一张"重新上市"名单，见文档 C2b。
+    """
+    list_dates = list_dates if list_dates is not None else load_list_dates()
+    cal = cal if cal is not None else trading_calendar()
+    out = {}
+    if len(cal) == 0:
+        return out
+    for code, ld in list_dates.items():
+        kind, n = listing_rule(code, ld)
+        if kind is None:
+            continue
+        i = int(cal.searchsorted(pd.Timestamp(ld), "left"))
+        if i >= len(cal):
+            continue
+        j = min(i + max(n, 1) - 1, len(cal) - 1)
+        out[code] = (kind, cal[i], cal[j], n)
+    return out
+
 
 
 def base_pct(code: str, date=None) -> float:
@@ -77,8 +224,17 @@ def base_pct(code: str, date=None) -> float:
 
 
 def limit_pct(code: str, date=None, is_st: bool = False) -> float:
-    """最终涨跌幅：ST 取 ±5%，否则按板块"""
-    if is_st:
+    """最终涨跌幅：**主板** ST 取 ±5%（2026-07-06 起放宽为 ±10%），其余按板块
+
+    ⚠️ ST 的 ±5% **只适用于主板**。创业板 2020-08-24 注册制改革后，
+    创业板与科创板的"风险警示股票"**不再单独设 5%**，仍按板块的 ±20%
+    执行；北交所有自己的风险警示制度，同样不走 5%。
+    早期实现给所有 ST 一律套 5%，会让这些股票的涨停价**偏低一半以上**
+    —— 实测造成约 5,000 行"最高价越过涨停价"（被 `--check listing` 抓到）。
+    """
+    if is_st and board_of(code) == "MAIN":
+        if date is not None and pd.Timestamp(date) >= MAIN_ST_10PCT_FROM:
+            return 0.10
         return 0.05
     return base_pct(code, date)
 
@@ -220,11 +376,16 @@ def st_mask(dates, code: str,
 def apply_limit_prices(df: pd.DataFrame, code: str,
                        st_map: Dict[str, List[Tuple]] = None,
                        pre_close_col: str = "pre_close",
-                       tick: float = TICK) -> pd.DataFrame:
+                       tick: float = TICK,
+                       listing_rule: Tuple = None) -> pd.DataFrame:
     """给带官方 `pre_close` 的日线表加上 `limit_up` / `limit_down`
 
     ⚠️ 必须传**官方 pre_close**（tushare 已按除权调整），
     绝不能用 `close.shift(1)` —— 那在除权日会算出错误的价格。
+
+    listing_rule: 上市初期特殊规则 `(kind, until, n)`，来自
+                  `listing_windows().get(code)`。不传 = 不做上市初期处理
+                  （回测区间不覆盖次新股时结果一样，但校验会报不一致）。
     """
     out = df.copy()
     if pre_close_col not in out.columns:
@@ -236,9 +397,11 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
     # 创业板制度切换（按日）
     if str(code).zfill(6).startswith(GEM_PREFIXES):
         pct = np.where(dates < GEM_20PCT_FROM, 0.10, 0.20)
-    # ST 区间覆盖
-    if st_map:
-        pct = np.where(st_mask(dates, code, st_map), 0.05, pct)
+    # ST 区间覆盖（**只对主板**生效：创业板/科创板/北交所的 ST 仍走板块档位）
+    # 2026-07-06 起主板 ST 也是 ±10%，与主板常规档位相同 -> 无需覆盖
+    if st_map and board_of(code) == "MAIN":
+        st = st_mask(dates, code, st_map) & (dates < MAIN_ST_10PCT_FROM).to_numpy()
+        pct = np.where(st, 0.05, pct)
 
     # 整数 tick 运算 + 四舍五入（交易所口径，非银行家舍入）
     bad = ~(pc > 0)
@@ -246,6 +409,31 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
     k_up, k_dn = _pct_factors(pct)
     up = _round_half_up(pc_t * k_up, PCT_DEN) * tick
     dn = _round_half_up(pc_t * k_dn, PCT_DEN) * tick
+
+    # ---- 上市初期特殊规则（覆盖上面的常规档位）----
+    if listing_rule:
+        kind, start, until, _n = listing_rule
+        # ⚠️ 必须**同时判上下界**：只判上界会把"数据起点早于 list_date"的股票
+        # （重新上市股）的整段历史都算进窗口。
+        in_win = ((dates >= pd.Timestamp(start))
+                  & (dates <= pd.Timestamp(until))).to_numpy()
+        if kind == NO_LIMIT:
+            # 不设涨跌幅 -> NaN。引擎的 `_num()` 对 NaN 返回 None 会**跳过**
+            # 涨跌停检查，正是"无限制"的语义。
+            up = np.where(in_win, np.nan, up)
+            dn = np.where(in_win, np.nan, dn)
+            bad = bad | in_win
+        elif kind == FIRST_44:
+            # 首日**有效申报价格**不高于发行价×1.44、不低于×0.64 —— 注意这**不是**
+            # 对称的 ±44%（跌的方向只有 −36%）。基准是发行价，而 tushare 首日的
+            # `pre_close` 正是发行价（已用 002973 等实测确认）。
+            up = np.where(in_win,
+                          _round_half_up(pc_t * K44_UP, PCT_DEN) * tick, up)
+            dn = np.where(in_win,
+                          _round_half_up(pc_t * K44_DN, PCT_DEN) * tick, dn)
+        else:
+            raise ValueError(f"未知的上市初期规则 {kind!r}")
+
     out["limit_up"] = np.round(up, 10)
     out["limit_down"] = np.round(dn, 10)
     out.loc[bad, ["limit_up", "limit_down"]] = np.nan

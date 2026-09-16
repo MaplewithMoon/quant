@@ -257,19 +257,23 @@ def run_validation():
 def rebuild_limit_year(year):
     """从清洗层日线计算涨跌停价
 
-    ⚠️ 两处修正（原先这里是错的，且会覆盖 rebuild_limit.py 生成的正確数据）：
+    ⚠️ 三处修正（原先这里是错的，且会覆盖 rebuild_limit.py 生成的正確数据）：
       1. **用官方 pre_close**，不是 `close.shift(1)`。后者是未除权的昨收，
          除权除息日算出的涨跌停价会错得离谱（10 送 10 时差一倍）。
       2. **规则统一到 database/limit_rules.py**：补上 ST ±5% 与北交所
          43/83/87/88（原先只认 920），并处理创业板 2020-08-24 的制度切换。
+      3. **上市初期特殊规则**（前 N 日不设涨跌幅 -> limit 为空 / 首日 ±44%），
+         必须与全量重建用同一份 `listing_windows()`，否则增量会覆盖掉全量的结果。
     """
-    from database.limit_rules import apply_limit_prices, load_st_intervals
+    from database.limit_rules import (apply_limit_prices, listing_windows,
+                                      load_st_intervals)
     src = CLEANED_DAILY / f"year={year}"
     dst = LIMIT_DIR / f"year={year}"
     if not src.exists():
         return
     os.makedirs(dst, exist_ok=True)
     st_map = load_st_intervals()
+    windows = listing_windows()
     n = 0
     for f in sorted(src.glob("*.parquet")):
         code = f.stem
@@ -279,12 +283,17 @@ def rebuild_limit_year(year):
             print(f"  [跳过] {code}: 清洗层缺 pre_close，无法正确计算涨跌停")
             continue
         df = df.sort_values("trade_date")
-        out = apply_limit_prices(df, code, st_map)
-        out = out[["code", "trade_date", "pre_close", "limit_up",
-                   "limit_down"]].dropna(subset=["limit_up", "limit_down"])
+        out = apply_limit_prices(df, code, st_map,
+                                 listing_rule=windows.get(code))
+        # **不要 dropna**：limit 为空可能是"不设涨跌幅"（新股上市初期）或
+        # pre_close 缺失，两种都要保留成空值行 —— 空值在引擎里表示"没有涨跌停
+        # 限制"（`_num()` 返回 None 会跳过检查），删掉行会造成增量与全量重建
+        # 的口径不一致。
+        out = out[["code", "trade_date", "pre_close", "limit_up", "limit_down"]]
         out.to_parquet(dst / f"{code}.parquet", index=False)
         n += 1
-    print(f"  涨跌停价 {year}: {n} 文件（用官方 pre_close + 统一规则）", flush=True)
+    print(f"  涨跌停价 {year}: {n} 文件（官方 pre_close + 统一规则 + 上市初期规则）",
+          flush=True)
 
 
 def main():

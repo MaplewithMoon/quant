@@ -328,9 +328,6 @@ def check_limit_rules(sample_codes: int = 300):
         r = con.execute(f"""SELECT
             count(*) n,
             sum(CASE WHEN limit_up IS NULL OR limit_down IS NULL THEN 1 ELSE 0 END) n_null,
-            sum(CASE WHEN limit_up IS NULL AND NOT (code LIKE '920%'
-                     AND trade_date < DATE '2023-01-01')
-                     THEN 1 ELSE 0 END) n_null_bad,
             sum(CASE WHEN limit_up < limit_down THEN 1 ELSE 0 END) n_inv,
             sum(CASE WHEN limit_up = limit_down THEN 1 ELSE 0 END) n_eq,
             sum(CASE WHEN limit_up = limit_down AND pre_close > 0.09
@@ -353,11 +350,30 @@ def check_limit_rules(sample_codes: int = 300):
         con.close()
         return
     log(f"总行数 {int(r['n']):,}")
-    # 北交所 920xxx 在 2023 年之前的历史（其实是不存在北交所时期的新三板数据）
-    # 里 pre_close 是垃圾值（常为 0.01 或缺失），属**已知上游限制**（C1）。
-    # 所以只对"2023 年起 + 非 920"要求非空 —— 否则门禁会永久变红、失去意义。
-    report("涨跌停价非空（2023 起 / 非北交所）", int(r["n_null_bad"]) == 0,
-           f"空值 {int(r['n_null']):,}，其中非已知限制的 {int(r['n_null_bad']):,}")
+    # 【空值判据】limit 为空有且只有三种合法来源：
+    #   ① 上市初期"不设涨跌幅"窗口（科创板/创业板注册制/主板 2023 起前 5 日、
+    #      主板与创业板开板初期首日），2026-09 起建模，约 8,700 行
+    #   ② 北交所 920xxx 在 2023 年之前 pre_close 本身就是垃圾值（C1），238 行
+    #   ③ 以上都不是 -> 真问题
+    # 所以这里逐行核对，而不是简单地要求"为空的行数 = 0"。
+    from database.limit_rules import NO_LIMIT, listing_windows
+    nulls = con.execute(f"""SELECT code, trade_date FROM read_parquet('{g}')
+                            WHERE limit_up IS NULL""").fetchdf()
+    win = listing_windows()
+    n_window = n_junk = n_bad = 0
+    for rr in nulls.itertuples(index=False):
+        code, td = rr.code, pd.Timestamp(rr.trade_date)
+        w = win.get(code)
+        if w and w[0] == NO_LIMIT and w[1] <= td <= w[2]:
+            n_window += 1
+        elif str(code).startswith("920") and td < pd.Timestamp("2023-01-01"):
+            n_junk += 1
+        else:
+            n_bad += 1
+    log(f"涨跌停价为空的行: {len(nulls):,}"
+        f"（上市初期不设涨跌幅 {n_window:,} / 北交所垃圾昨收 {n_junk:,}）")
+    report("涨跌停价空值均可解释", n_bad == 0,
+           f"无法解释的空值 {n_bad:,} 行")
     # 真倒挂（<）一行都不该有；相等（=）在价格粒度粗于涨跌幅时是**必然结果**
     # （0.09 元的 ST 股 ±5% ⇒ 上下限都四舍五入到 0.09），不是数据错误。
     report("limit_up 不小于 limit_down", int(r["n_inv"]) == 0,
@@ -374,10 +390,12 @@ def check_limit_rules(sample_codes: int = 300):
 
     # 最强的一条：用唯一实现逐行重算并比对（能同时抓住规则错和舍入错）
     # 只发**一次**查询把所有抽样股票取回来，再在 pandas 里按股票分组重算。
-    from database.limit_rules import apply_limit_prices, load_st_intervals
+    from database.limit_rules import (apply_limit_prices, listing_windows,
+                                      load_st_intervals)
     codes = con.execute(f"""SELECT DISTINCT code FROM read_parquet('{g}')
                             ORDER BY code LIMIT {sample_codes}""").fetchdf()["code"].tolist()
     st_map = load_st_intervals()
+    windows = listing_windows()
     diff = n = 0
     if codes:
         ph = ",".join(["?"] * len(codes))
@@ -385,7 +403,8 @@ def check_limit_rules(sample_codes: int = 300):
                             FROM read_parquet('{g}') WHERE code IN ({ph})""",
                         codes).fetchdf()
         for c, sub in s.groupby("code"):
-            exp = apply_limit_prices(sub, c, st_map)
+            exp = apply_limit_prices(sub, c, st_map,
+                                     listing_rule=windows.get(c))
             n += len(sub)
             diff += int((abs(exp["limit_up"]
                              - pd.to_numeric(sub["limit_up"])) > 0.005).sum())
@@ -402,6 +421,94 @@ def check_limit_rules(sample_codes: int = 300):
         f"20%={int(r['p20']):,} 30%={int(r['p30']):,}  合计 {known/tot:.2%}")
     report("涨跌停档位可识别率 > 99%", known / tot > 0.99,
            f"仅 {known/tot:.2%} 落在 5/10/20/30% 档")
+
+
+# ============================================================
+# 4b. 上市初期规则（2026-09 新增）
+# ============================================================
+def check_listing_rules():
+    """上市初期特殊规则的**实证**校验
+
+    制度条文容易记错，所以这里不掉书袋，直接用**行情数据反证**：
+      ① 不设涨跌幅的窗口内，确实存在价格突破常规档位的交易日
+         （若一条都没有，说明规则要么没生效、要么根本就不该有）
+      ② 全库最高价不得超过涨停价、最低价不得低于跌停价
+         —— ±44% 的首日也必须满足这条
+      ③ 首日 ±44% 确实"在 44% 处封顶"：存在大量贴着 44% 的涨停行
+    """
+    print("\n[上市初期规则] 前 N 日不设涨跌幅 / 首日 ±44%")
+    from database.config import parquet_glob
+    lg = parquet_glob(dir_of("limit"))
+    dg = parquet_glob(dir_of("daily"))
+    con = connect_duckdb()
+    # 北交所 920xxx 在 2023 年之前 pre_close 是垃圾值（C1），
+    # 它的涨跌停价本身无意义，必须排除，否则门禁永远红着。
+    NOT_JUNK = "NOT (l.code LIKE '920%' AND l.trade_date < DATE '2023-01-01')"
+    try:
+        r = con.execute(f"""
+            WITH l AS (SELECT code, trade_date, pre_close, limit_up, limit_down
+                       FROM read_parquet('{lg}')),
+                 d AS (SELECT code, trade_date, high, low
+                       FROM read_parquet('{dg}'))
+            SELECT count(*) n,
+              sum(CASE WHEN l.pre_close > 0 AND l.limit_up IS NULL
+                       THEN 1 ELSE 0 END) nolimit,
+              sum(CASE WHEN l.pre_close > 0 AND l.limit_up IS NULL
+                        AND d.high > l.pre_close * 1.31
+                       THEN 1 ELSE 0 END) broke_band,
+              sum(CASE WHEN l.limit_up IS NOT NULL AND {NOT_JUNK}
+                        AND d.high > l.limit_up + 0.011
+                       THEN 1 ELSE 0 END) over_up,
+              sum(CASE WHEN l.limit_down IS NOT NULL AND {NOT_JUNK}
+                        AND d.low < l.limit_down - 0.011
+                       THEN 1 ELSE 0 END) under_dn,
+              sum(CASE WHEN l.pre_close > 0 AND l.limit_up IS NOT NULL
+                        AND abs(l.limit_up / l.pre_close - 1.44) < 0.005
+                       THEN 1 ELSE 0 END) n44
+            FROM l JOIN d USING (code, trade_date)
+        """).fetchdf().iloc[0]
+    except Exception as e:
+        report("上市初期规则读取", False, str(e)[:80])
+        con.close()
+        return
+    n = int(r["n"])
+    log(f"配对行数 {n:,}")
+    log(f"  不设涨跌幅的行（limit 为空且 pre_close>0）: {int(r['nolimit']):,}")
+    log(f"    其中价格突破 ±31%（任何常规档位都不可能）: {int(r['broke_band']):,}")
+    log(f"  首日 ±44% 的行: {int(r['n44']):,}")
+    report("不设涨跌幅的窗口确实存在", int(r["nolimit"]) > 0,
+           f"{int(r['nolimit']):,} 行")
+    # 若窗口内的价格从未突破常规档位，说明这条规则对数据毫无影响 —— 要么规则
+    # 没被真正应用，要么适用面判断错了，两种情况都该人工看一眼。
+    report("不设涨跌幅窗口内有突破常规档位的行情",
+           int(r["broke_band"]) > 0,
+           f"{int(r['broke_band']):,} 行（少于此数说明规则可能没生效）")
+    report("首日 ±44% 规则生效", int(r["n44"]) > 0, f"{int(r['n44']):,} 行")
+
+    # 价格越界：**用比率门禁 + 归因**，不用绝对 0。
+    # 历史上有少量零散的制度性例外（2006-2007 未股改股、2014 的 6 行 +45.2% 等），
+    # 要求绝对 0 会让门禁永久变红、失去报警价值。这里给出占比与最大越界者。
+    for name, cnt in (("最高价 > 涨停价", int(r["over_up"])),
+                      ("最低价 < 跌停价", int(r["under_dn"]))):
+        rate = cnt / n if n else 0
+        report(f"{name}（占比 < 0.02%）", rate < 0.0002,
+               f"{cnt:,} 行 / {rate:.4%}")
+    if int(r["over_up"]):
+        try:
+            top = con.execute(f"""
+                WITH l AS (SELECT code, trade_date, pre_close, limit_up
+                           FROM read_parquet('{lg}')),
+                     d AS (SELECT code, trade_date, high FROM read_parquet('{dg}'))
+                SELECT year(l.trade_date) y, count(*) c FROM l JOIN d USING (code, trade_date)
+                WHERE l.limit_up IS NOT NULL AND {NOT_JUNK}
+                  AND d.high > l.limit_up + 0.011
+                GROUP BY 1 ORDER BY 2 DESC LIMIT 6
+            """).fetchdf()
+            log("    越界最多的年份: " +
+                ", ".join(f"{int(x.y)}={int(x.c)}" for x in top.itertuples(index=False)))
+        except Exception:
+            pass
+    con.close()
 
 
 
@@ -727,7 +834,8 @@ def main():
     parser = argparse.ArgumentParser(description="数据库质量校验")
     parser.add_argument("--check", action="append",
                         choices=["unique", "schema", "coverage", "limit",
-                                 "completeness", "status", "dates", "all"],
+                                 "completeness", "status", "dates", "listing",
+                                 "all"],
                         help="可重复指定，如 --check limit --check completeness；"
                              "不传等价于 all")
     parser.add_argument("--quick", action="store_true", help="抽样快速检查")
@@ -739,7 +847,7 @@ def main():
     wanted = set(args.check or ["all"])
     if "all" in wanted:
         wanted = {"unique", "schema", "coverage", "limit", "completeness",
-                  "status", "dates"}
+                  "status", "dates", "listing"}
 
     if "unique" in wanted:
         for ds in ["daily", "frozen/valuation", "frozen/adjust"]:
@@ -751,6 +859,8 @@ def main():
         check_coverage(quick=args.quick)
     if "limit" in wanted:
         check_limit_rules()
+    if "listing" in wanted:
+        check_listing_rules()
     if "completeness" in wanted:
         check_year_completeness()
     if "status" in wanted:

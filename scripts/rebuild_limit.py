@@ -37,6 +37,7 @@ import pandas as pd
 from database.config import FROZEN_ROOT, dir_of
 from database.limit_rules import (BEIJING_PREFIXES, apply_limit_prices,
                                   base_pct as _base_pct,
+                                  listing_windows,
                                   load_st_intervals as _load_st_intervals)
 
 SRC = dir_of("daily")             # db/cleaned/daily_basic
@@ -64,12 +65,16 @@ def rebuild():
 
     files = sorted(SRC.glob("year=*/*.parquet"))
     st_map = load_st_intervals()
+    # 上市初期特殊规则（前 N 日不设涨跌幅 / 首日 ±44%），按"板块 × 上市日"定
+    windows = listing_windows()
     print(f"源: {SRC}", flush=True)
     print(f"目标: {DST}", flush=True)
     print(f"ST 区间表: {len(st_map):,} 只股票带 ST 记录", flush=True)
+    print(f"上市初期特殊规则: {len(windows):,} 只股票适用", flush=True)
     print(f"重建涨跌停价: {len(files):,} 文件", flush=True)
 
     total = 0
+    n_nolimit = 0
     for i, f in enumerate(files):
         code = f.stem
         year = f.parent.name.split("=")[1]
@@ -82,9 +87,11 @@ def rebuild():
         d = d.sort_values("trade_date").reset_index(drop=True)
 
         # 交易所口径：涨跌停价按昨收（除权后参考价）× (1 ± 幅度)，四舍五入到分。
-        # 规则（含 ST 5%、北交所 30%、创业板 2020-08-24 前 10%）统一在
-        # database/limit_rules.py，这里不再自己实现一遍。
-        out = apply_limit_prices(d, code, st_map)
+        # 规则（含 ST 5%、北交所 30%、创业板 2020-08-24 前 10%、上市初期特殊
+        # 规则）统一在 database/limit_rules.py，这里不再自己实现一遍。
+        out = apply_limit_prices(d, code, st_map,
+                                 listing_rule=windows.get(code))
+        n_nolimit += int(out["limit_up"].isna().sum())
         out = out[["code", "trade_date", "pre_close", "limit_up", "limit_down"]]
 
         part = DST / f"year={year}"
@@ -95,6 +102,7 @@ def rebuild():
             print(f"  进度 {i+1:,}/{len(files):,}", flush=True)
 
     print(f"完成: {len(files):,} 文件, {total:,} 行", flush=True)
+    print(f"其中不设涨跌幅(limit 为空)的行: {n_nolimit:,}", flush=True)
 
     # 记录生成信息
     from database.provenance import stamp_dataset

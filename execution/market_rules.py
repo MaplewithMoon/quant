@@ -29,7 +29,14 @@ LIMIT_TOL = 5e-3
 
 
 def _num(bar, col):
-    """从 bar 里安全取浮点数：列不存在或为 NaN 时返回 None"""
+    """从 bar 里安全取浮点数：列不存在或为 NaN 时返回 None
+
+    ⚠️ **NaN 是有语义的**：`limit_up` / `limit_down` 为 NaN 表示该日
+    **不设涨跌幅限制**（新股上市初期 —— 科创板/创业板注册制/主板 2023 起的
+    前 5 个交易日、主板 2013-2023 首日不适用 44% 的重新上市等）。
+    返回 None 会让调用方**跳过**涨跌停检查，正是"无限制"应有的行为。
+    见 `database/limit_rules.py` 的 `LISTING_REGIMES`。
+    """
     try:
         v = bar.get(col)
     except Exception:
@@ -77,6 +84,9 @@ class MarketRules:
     block_suspended:        停牌不可交易
     block_limit_up_buy:     涨停（封板）不可买入
     block_limit_down_sell:  跌停（封板）不可卖出
+
+    ⚠️ `limit_up` / `limit_down` 为 **NaN 表示"不设涨跌幅限制"**（新股上市
+    初期），此时检查被**跳过**（放行）—— 这是有意为之，不是缺数据。
     """
     enabled: bool = True
     lot_size: int = 100

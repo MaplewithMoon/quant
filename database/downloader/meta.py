@@ -114,7 +114,8 @@ class MetaDownloader(BaseDownloader):
         return _lp(code, None, is_st)
 
     def download_code(self, code: str, daily: pd.DataFrame) -> pd.DataFrame:
-        from database.limit_rules import apply_limit_prices, load_st_intervals
+        from database.limit_rules import (apply_limit_prices, listing_windows,
+                                          load_st_intervals)
         if daily.empty:
             self.storage.mark_done(code)
             return pd.DataFrame()
@@ -126,9 +127,14 @@ class MetaDownloader(BaseDownloader):
         st_map = getattr(self, "_st_map", None)
         if st_map is None:
             st_map = self._st_map = load_st_intervals()
-        out = apply_limit_prices(df, code, st_map)
-        out = out[["code", "trade_date", "pre_close", "limit_up",
-                   "limit_down"]].dropna(subset=["limit_up", "limit_down"])
+        windows = getattr(self, "_listing_windows", None)
+        if windows is None:
+            windows = self._listing_windows = listing_windows()
+        out = apply_limit_prices(df, code, st_map,
+                                 listing_rule=windows.get(code))
+        # **不要 dropna**：limit 为空可能是"不设涨跌幅"（新股上市初期），
+        # 与全量重建 / 增量更新保持同一口径（空值 = 无涨跌停限制）
+        out = out[["code", "trade_date", "pre_close", "limit_up", "limit_down"]]
         out["year"] = pd.to_datetime(out["trade_date"]).dt.year
         for y, g in out.groupby("year"):
             if y < self.start_year:

@@ -232,8 +232,14 @@ def test_validate_data_returns_nonzero_on_failure():
     ⚠️ 这个测试**不能依赖真实 db**：CI 在干净环境里跑，没有 db/，
     早先的写法直接 `subprocess.run(validate_data.py)` 再断言退出码 0，
     在没有数据的机器上必然失败（"无文件"会被记为问题）。
-    这里改成把三个检查函数打桩，只验证**退出码契约**本身：
+    这里改成把所有 `check_*` 检查函数打桩，只验证**退出码契约**本身：
         无问题 -> 0 ／ 有问题 -> 1 ／ --no-strict-exit -> 永远是 0
+
+    ⚠️ 打桩必须**覆盖全部** `check_*`：`--check all` 会逐个调用它们，
+    漏掉任何一个就会去读真实数据库，CI 上必然失败。
+    早期版本只硬编码了 3 个（unique/schema/coverage），本轮新增
+    listing/status/dates 之后就漏了 —— 所以这里按前缀批量打桩，
+    以后再加检查也不用改这个测试。
     """
     py = sys.executable
 
@@ -245,9 +251,8 @@ def test_validate_data_returns_nonzero_on_failure():
         return subprocess.run([py, "-c", code], cwd=ROOT, capture_output=True,
                               text=True, encoding="utf-8", errors="replace")
 
-    stub_clean = ("v.check_uniqueness=lambda *a,**k: None;"
-                  "v.check_schema=lambda *a,**k: None;"
-                  "v.check_coverage=lambda *a,**k: None;"
+    stub_clean = ("[setattr(v, n, (lambda *a, **k: None))"
+                  " for n in dir(v) if n.startswith('check_')];"
                   "sys.argv=['validate_data.py','--check','all'];")
 
     r0 = run(stub_clean)
