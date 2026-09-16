@@ -119,7 +119,6 @@ def rebalance_dates(index: pd.DatetimeIndex, rule="M") -> pd.DatetimeIndex:
     if isinstance(rule, int) and not isinstance(rule, bool):
         return index[::max(rule, 1)]
     idx = pd.DatetimeIndex(index)
-    s = pd.Series(idx, index=idx)
     if rule == "D":
         return idx
     if rule == "W":

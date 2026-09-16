@@ -23,9 +23,12 @@ import os
 import sys
 import time
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
-                              line_buffering=True, write_through=True)
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import numpy as np
 import pandas as pd
@@ -183,7 +186,6 @@ def main():
     # ---------- 2. 逐因子评估（IC 序列只算一次，再按区间切片）----------
     banner("2. 因子 IC（调仓日横截面 RankIC）"
            + ("  行业+市值中性" if args.neutralize else ""), "-")
-    tr_idx, te_idx = reb[reb < split], reb[reb >= split]
     rows = []
     for name, f in factors.items():
         t2 = time.time()

@@ -7,9 +7,14 @@ main.py 是历史入口，回测功能已统一到 scripts/backtest.py（CLI + �
     python main.py               # 运行多策略对比（等效 scripts/backtest.py --compare）
     python main.py --symbol 600519 --strategy Turtle   # 单策略（等效 scripts/backtest.py）
 """
-import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import sys
+import io
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import argparse
 import scripts.backtest as bt

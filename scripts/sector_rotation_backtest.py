@@ -30,9 +30,12 @@ import time
 # 逐行刷新：不能只写 `io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")`，
 # 那样会新建一个**块缓冲**包装器，把 `python -u` 的无缓冲设置覆盖掉 ——
 # 长任务重定向到日志文件时，要等 8KB 缓冲满了才落盘，看不到进度。
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
-                              line_buffering=True, write_through=True)
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import numpy as np
 import pandas as pd
@@ -273,7 +276,6 @@ def main():
     # ---------- 4. 训练集寻优 ----------
     search = None
     best_params = dict(base_params)
-    overfit = None
     if args.optimize:
         banner("3. 训练集参数寻优（样本外不参与）", "-")
         if args.grid == "quick":

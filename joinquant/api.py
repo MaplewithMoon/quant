@@ -18,7 +18,7 @@
 """
 import datetime
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date as _date, timedelta
 from typing import Callable, Dict, List, Optional
 
@@ -476,7 +476,6 @@ class _CurrentData:
 
     def __getitem__(self, code):
         eng = self._eng
-        d = pd.Timestamp(eng.current_date)
         nam = eng.data.name_of(code)
         if nam == "" and code not in eng.data._close.columns:
             self._missing += 1
@@ -778,7 +777,6 @@ class JQEngine:
         if px is None or not np.isfinite(px) or px <= 0:
             eng._reject("无有效成交价（停牌/未上市）")
             return None
-        cur_size = eng.pf.position_size(code)
         target_size = max(float(value), 0.0) / px
         # 按一手取整（聚宽同样只接受 100 股整数倍）
         target_size = float(int(target_size // 100) * 100)
@@ -869,7 +867,7 @@ class JQEngine:
         self.context = Context(self)
         initialize(self.context)
         self._rebuild_broker()
-        equity, holdings, trades = [], [], []
+        equity, holdings = [], []
         prev = None
         for i, d in enumerate(dates):
             self.current_date = d

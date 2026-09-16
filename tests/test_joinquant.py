@@ -62,7 +62,6 @@ def test_run_daily_order_and_weekly_nth_trading_day():
     m = _module({}, initialize)
     eng = JQEngine(JQData(p, dates[0], dates[-1]), 100000, fill="close")
     eng.run(m.initialize, dates)
-    uniq = [d.date() for d in dates]
     daily = [c for c in calls if c[0] == "open"]
     assert len(daily) == len(dates), f"run_daily 应每天一次，实得 {len(daily)}"
     # 同一天内 9:05 必须在 14:50 之前
@@ -457,7 +456,6 @@ def test_end_to_end_mini_strategy():
         jq.run_daily(_rebalance, "10:00")
 
     def _rebalance(context):
-        ctx = eng.context if False else None
         # 每周第 1 个交易日调仓
         idx = mgr.dates
         pos = idx.get_loc(pd.Timestamp(context.current_dt.date()))

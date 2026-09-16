@@ -220,14 +220,23 @@ class JQData:
         同一 (code, end_date) 多次公告只认**最早**那次（as-reported），
         与 factors/fundamental.py 的口径完全一致。
         """
-        from database.config import FROZEN_ROOT, connect_duckdb
+        # ⚠️ 不能写死 `year=*`：没有 db/ 时 DuckDB 会抛
+        # `IOException: No files found that match the pattern`，而这里是
+        # `try/finally`（没有 except），异常会直接冒出去 —— 于是**任何**
+        # `JQData(合成面板)` 都建不起来，测试在无数据库的环境（CI）里全挂。
+        # `year_globs()` 在数据集不存在时返回 "[]"，据此跳过查询即可。
+        from database.config import FROZEN_ROOT, connect_duckdb, year_globs
+        glob = year_globs(FROZEN_ROOT / "financial")
+        if glob == "[]":
+            self._fin = pd.DataFrame()
+            self._fin_dates = np.array([], dtype="datetime64[ns]")
+            return
         con = connect_duckdb()
-        glob = f"{(FROZEN_ROOT / 'financial').as_posix()}/year=*/profit_*.parquet"
         try:
             df = con.execute(
                 f"SELECT code, ann_date, end_date, report_type, revenue, "
                 f"n_income, n_income_attr_p "
-                f"FROM read_parquet('{glob}', union_by_name=True) "
+                f"FROM read_parquet({glob}, union_by_name=True) "
                 f"WHERE report_type = '1'").fetchdf()
         finally:
             con.close()

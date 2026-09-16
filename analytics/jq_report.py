@@ -18,7 +18,7 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from .performance import (align, annual_returns_table, drawdown_info,
+from .performance import (align, annual_returns_table,
                           drawdown_series, monthly_returns_table,
                           performance_summary, to_returns)
 
@@ -109,7 +109,8 @@ def _charts(equity: pd.Series, benchmark: pd.Series, split_date=None) -> str:
     ax.set_ylabel("净值（起点=1）")
     ax.legend(loc="upper left")
     ax.grid(alpha=.3)
-    imgs.append(_fig_to_b64(fig)); plt.close(fig)
+    imgs.append(_fig_to_b64(fig))
+    plt.close(fig)
 
     # 2) 回撤
     fig, ax = plt.subplots(figsize=(11, 2.6))
@@ -122,13 +123,15 @@ def _charts(equity: pd.Series, benchmark: pd.Series, split_date=None) -> str:
     ax.set_ylabel("回撤 (%)")
     ax.legend(loc="lower left", fontsize=9)
     ax.grid(alpha=.3)
-    imgs.append(_fig_to_b64(fig)); plt.close(fig)
+    imgs.append(_fig_to_b64(fig))
+    plt.close(fig)
 
     # 3) 分年度
     tbl = annual_returns_table(rp, rb)
     if not tbl.empty:
         fig, ax = plt.subplots(figsize=(11, 2.8))
-        x = np.arange(len(tbl)); w = .38
+        x = np.arange(len(tbl))
+        w = .38
         ax.bar(x - w/2, tbl["组合"] * 100, w, color="#c0392b", label="策略")
         ax.bar(x + w/2, tbl["基准"] * 100, w, color="#2c3e50", label="基准")
         for i, v in enumerate(tbl["组合"] * 100):
@@ -137,12 +140,14 @@ def _charts(equity: pd.Series, benchmark: pd.Series, split_date=None) -> str:
         for i, v in enumerate(tbl["基准"] * 100):
             ax.text(i + w/2, v, f"{v:.1f}", ha="center",
                     va="bottom" if v >= 0 else "top", fontsize=8)
-        ax.set_xticks(x); ax.set_xticklabels([str(i) for i in tbl.index])
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(i) for i in tbl.index])
         ax.axhline(0, color="black", lw=.9)
         ax.set_ylabel("年度收益 (%)")
         ax.legend(loc="upper left", fontsize=9)
         ax.grid(alpha=.3, axis="y")
-        imgs.append(_fig_to_b64(fig)); plt.close(fig)
+        imgs.append(_fig_to_b64(fig))
+        plt.close(fig)
 
     return "".join(f'<img src="data:image/png;base64,{b}"/>' for b in imgs)
 
@@ -225,7 +230,6 @@ def build_jq_report(equity: pd.Series, benchmark: pd.Series, title: str,
     rp = to_returns(equity)
     rb = to_returns(bench) if bench is not None else None
     summ = performance_summary(equity, bench)
-    dd = drawdown_info(equity)
     ts = trade_stats(trades)
     dsr = downside_risk(rp)
 

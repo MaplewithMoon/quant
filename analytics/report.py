@@ -127,7 +127,9 @@ def plot_performance(equity: pd.Series, benchmark: pd.Series,
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
 
-    T = (lambda zh_s, en_s: zh_s if zh else en_s)
+    def T(zh_s, en_s):
+        """按语言选择中文/英文标签（原先写成 lambda 赋值）"""
+        return zh_s if zh else en_s
 
     rets = align(equity, benchmark)
     if rets.empty:

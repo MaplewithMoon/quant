@@ -122,7 +122,6 @@ class RSIDivergence(Strategy):
         rsi = data["rsi"]
         curr_close = close.iloc[idx]
         curr_rsi = rsi.iloc[idx]
-        window = data.iloc[idx - self.lookback:idx + 1]
         prev_window = data.iloc[idx - self.lookback - 1:idx]
 
         close_low = close.iloc[idx - self.lookback:idx + 1].min()

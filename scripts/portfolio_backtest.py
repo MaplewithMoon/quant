@@ -22,11 +22,17 @@
 - 成交时点默认 next_open：T 日收盘算权重 → T+1 开盘成交，无未来函数。
 - 业绩归因对比基准为该指数的权重（同样取历史快照）。
 """
-import sys, io, os, argparse
+import sys
+import io
+import os
+import argparse
 # 逐行刷新，否则重定向到日志时要等缓冲区满才可见（会覆盖 python -u 的效果）
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
-                              line_buffering=True, write_through=True)
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import numpy as np
 import pandas as pd

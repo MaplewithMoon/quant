@@ -200,7 +200,6 @@ def test_composite_direction_alignment():
     add_factor("_neg", lambda pa: pd.DataFrame(1.0, index=idx, columns=p["close"].columns),
                direction=-1)
     sc = composite_score(p, ["_pos"], method="equal")
-    sc2 = composite_score(p, ["_neg"], method="equal")
     # 常量因子标准化后为 0，这里主要验证不报错且形状正确
     assert sc.shape == p["close"].shape
     print("[OK] 因子合成：方向对齐逻辑可运行（direction=-1 取负）")

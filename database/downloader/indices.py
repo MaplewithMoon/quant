@@ -36,7 +36,6 @@ class IndexConsDownloader(BaseDownloader):
                 if m_start[0] == 10:
                     m_end = 12
                 y_end = year if m_start[0] != 10 else year
-                end_day = 31 if m_start[0] != 10 else 31
                 quarters.append((f"{year}{m_start[0]:02d}{m_start[1]:02d}",
                                  f"{y_end}{m_end:02d}31"))
 

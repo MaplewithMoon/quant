@@ -26,9 +26,15 @@
     python scripts/rebuild_limit.py            # 全量重建
     python scripts/rebuild_limit.py --verify   # 重建后校验
 """
-import sys, io, shutil
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import sys
+import io
+import shutil
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import argparse
 import numpy as np

@@ -10,7 +10,9 @@ tushare pro.daily 字段: trade_date, open, high, low, close, pre_close,
     python scripts/download_tushare_raw.py --codes 000001,600519
     python scripts/download_tushare_raw.py --fresh     # 忽略断点重下
 """
-import sys, io, os
+import sys
+import io
+import os
 sys.path.insert(0, ".")
 
 import argparse

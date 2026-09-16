@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """股票统计：最高价、最低价、涨跌幅、多股对比表格"""
-import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-
-import os, contextlib
+import sys
+import io
+import os
+import contextlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import pandas as pd
 from data.dataset import DataSet

@@ -75,8 +75,18 @@ def _read_statements(kind: str, columns: List[str]) -> pd.DataFrame:
 
     返回长表: code, ann_date, end_date, <columns>
     """
+    empty = pd.DataFrame(columns=["code", "ann_date", "end_date"] + columns)
+    fin_dir = FROZEN_ROOT / "financial"
+    # ⚠️ 两件事必须做对：
+    #   1. glob 必须**限定到 {kind}_**（profit/balance/cashflow 三张表在同一个
+    #      目录里，列完全不同；用 `year=*/*.parquet` 配 union_by_name 会把三张
+    #      表的行混成一张）
+    #   2. 没有 db/ 时要返回空表而不是让 DuckDB 抛
+    #      `IOException: No files found`（这里的 try 只有 finally，异常会冒出去）
+    if not any(fin_dir.glob(f"year=*/{kind}_*.parquet")):
+        return empty
     con = connect_duckdb()
-    glob = f"{(FROZEN_ROOT / 'financial').as_posix()}/year=*/{kind}_*.parquet"
+    glob = f"{fin_dir.as_posix()}/year=*/{kind}_*.parquet"
     cols = ", ".join(["code", "ann_date", "end_date", "report_type"] + columns)
     try:
         df = con.execute(

@@ -178,7 +178,7 @@ def drawdown_info(equity: pd.Series) -> DrawdownInfo:
 
     # 最长未创新高持续期
     new_high = e >= e.cummax()
-    longest, cur, prev = 0, 0, e.index[0]
+    longest, cur = 0, 0
     for d, is_high in new_high.items():
         if is_high:
             cur = 0

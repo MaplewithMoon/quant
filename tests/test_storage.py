@@ -231,7 +231,7 @@ def test_tushare_rate_limit_on_every_retry():
     finally:
         _t.sleep = orig
     assert waits["n"] == calls["n"] == 3, f"限流应调用 3 次，实际 {waits['n']}"
-    print(f"[OK] 重试不绕限流：3 次尝试对应 3 次限流调用")
+    print("[OK] 重试不绕限流：3 次尝试对应 3 次限流调用")
 
 
 # ============================================================

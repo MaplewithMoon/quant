@@ -32,7 +32,7 @@ def test_board_tiers():
     for code, exp in cases:
         got = base_pct(code, "2024-06-03")
         assert abs(got - exp) < 1e-12, f"{code} 应为 {exp}，实得 {got}"
-    print(f"[OK] 板块档位：主板/中小板 10%、创业板/科创板 20%、北交所 30%")
+    print("[OK] 板块档位：主板/中小板 10%、创业板/科创板 20%、北交所 30%")
 
 
 def test_gem_regime_switch():

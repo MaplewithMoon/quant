@@ -105,7 +105,7 @@ filterwarnings = ["ignore::DeprecationWarning"]
 
 
 # -----------------------------------------------------------------------------
-#  ruff：静态检查（目前仅本地使用，尚未接入 CI 作为门禁）
+#  ruff：静态检查（**CI 门禁**，见 .github/workflows/ci.yml 的 lint job）
 #  pip install -e ".[dev]" 后执行：ruff check .
 #  自动修复：ruff check . --fix
 # -----------------------------------------------------------------------------
@@ -119,14 +119,21 @@ extend-exclude = [
     "vnpy-4.4.0",
     "方正证券FQT交易客户端-40438",
     ".deps",
+    ".cache",
+    # 聚宽平台的**原版策略文件**（scripts/port_joinquant.py 的输入）。
+    # 它们不是本项目代码、也不进版本库，但会躺在工作目录里被 `ruff check .` 扫到，
+    # 而且理应有大量告警（`from jqdata import *` 等平台 API）。生成物
+    # strategies/jq/*.py 才需要检查，它们在文件头自带 `# ruff: noqa`。
+    "动态持仓 止损线9 单价不超过50-Clone.py",
+    "添加399101可选-Clone.py",
 ]
 
 [tool.ruff.lint]
-# 先只开"能抓真 bug"的规则，避免一上来几千条噪音
+# 只开"能抓真 bug"的规则，避免几千条风格噪音
 #   E4/E7/E9 = 导入、语句、语法层面的错误
-#   F        = pyflakes：未使用导入/变量、未定义名字（本次审查发现的死代码就能靠它抓）
+#   F        = pyflakes：未定义名字、未使用变量、重定义（死代码靠它抓）
 select = ["E4", "E7", "E9", "F"]
 ignore = [
     "E402",  # 允许模块级 import 不在文件顶部（现有脚本大量 sys.path.insert 后 import）
-    "F401",  # 未使用导入：先只提示不阻断
+    "F401",  # 未使用导入：存量较多，暂不阻断（新代码请别留）
 ]

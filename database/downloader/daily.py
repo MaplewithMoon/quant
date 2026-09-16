@@ -140,7 +140,7 @@ class DailyDownloader(BaseDownloader):
             for code in todo:
                 self.storage.assert_disk_ok()
                 try:
-                    df = self.download_code(code)
+                    self.download_code(code)
                 except Exception as e:
                     self.logger.error(f"{code} 下载失败，已记录断点: {e}")
                 pbar.set_postfix(code=code)

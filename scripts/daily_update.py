@@ -15,7 +15,9 @@
     python scripts/daily_update.py --only valuation # 只更新估值
     python scripts/daily_update.py --days 10        # 回看天数（默认15）
 """
-import sys, io, os
+import sys
+import io
+import os
 sys.path.insert(0, ".")
 
 import argparse
@@ -140,12 +142,12 @@ def clean_file(df):
     for c in ["open", "high", "low", "close"]:
         v = pd.to_numeric(df[c], errors="coerce")
         bad |= v.isna() | (v <= 0)
-    o, h, l, cl = (pd.to_numeric(df[c], errors="coerce") for c in ["open", "high", "low", "close"])
-    vok = o.notna() & h.notna() & l.notna() & cl.notna()
-    bad |= vok & ~(h >= l) | vok & ~(l <= o) | vok & ~(o <= h) | vok & ~(l <= cl) | vok & ~(cl <= h)
+    o, h, lo, cl = (pd.to_numeric(df[c], errors="coerce") for c in ["open", "high", "low", "close"])
+    vok = o.notna() & h.notna() & lo.notna() & cl.notna()
+    bad |= vok & ~(h >= lo) | vok & ~(lo <= o) | vok & ~(o <= h) | vok & ~(lo <= cl) | vok & ~(cl <= h)
     amt = pd.to_numeric(df["amount"], errors="coerce")
     vwap = amt / vol.replace(0, pd.NA)
-    bad |= vwap.notna() & vok & ~((vwap >= l * 0.95) & (vwap <= h * 1.05))
+    bad |= vwap.notna() & vok & ~((vwap >= lo * 0.95) & (vwap <= h * 1.05))
     return df[~bad]
 
 

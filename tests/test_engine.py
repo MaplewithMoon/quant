@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """测试：回测引擎 + 订单执行"""
-import sys, io, os
+import sys
+import io
+import os
 # 不在 import 阶段替换 sys.stdout（会破坏 pytest 的输出捕获，见 test_loader.py 注释）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,7 +48,7 @@ def test_buy_and_hold_positive():
     df = make_rising_daily(n=50, daily_ret=0.002)   # 每日+0.2%，确定性上涨
     ds = DataSet(symbol="TEST", data=df.set_index("trade_date"))
     engine = BacktestEngine(initial_capital=100_000)
-    trades = engine.run(ds, BuyAndHold())
+    engine.run(ds, BuyAndHold())
     assert engine.portfolio.total_value > 100_000, "上涨行情应盈利"
     print(f"[OK] BuyAndHold 盈利: {engine.portfolio.total_value:,.0f}")
 

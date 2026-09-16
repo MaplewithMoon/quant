@@ -13,9 +13,14 @@
 【运行】
     python scripts/semiconductor_rotation.py
 """
-import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import sys
+import io
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import glob
 import numpy as np
@@ -111,7 +116,7 @@ print(f"回测交易日数: {len(all_dates)}")
 # 1.5 加载基准指数（沪深300）——用于对比策略相对市场的表现
 try:
     import glob as _glob
-    bench_files = _glob.glob(f"db/frozen/index_daily/year=*/*.parquet")
+    bench_files = _glob.glob("db/frozen/index_daily/year=*/*.parquet")
     bench = pd.concat([pd.read_parquet(f) for f in bench_files], ignore_index=True)
     bench = bench[bench["index_code"] == BENCHMARK].copy()
     bench["trade_date"] = pd.to_datetime(bench["trade_date"])
@@ -345,7 +350,6 @@ print("=" * 60)
 print("第3步：绩效评估")
 print("=" * 60)
 
-import numpy as np
 
 # 4.1 日收益率序列
 strategy_ret = equity_df.pct_change().dropna()          # 策略日收益

@@ -57,14 +57,22 @@ class UniverseSpec:
 # 指数历史成分
 # ============================================================
 def load_index_members(index_code: str = "000300.SH") -> pd.DataFrame:
-    """读取指数成分的历史快照（长表：trade_date, code, weight）"""
-    from database.config import connect_duckdb
-    glob = f"{FROZEN_ROOT.as_posix()}/index_cons/year=*/*.parquet"
+    """读取指数成分的历史快照（长表：trade_date, code, weight）
+
+    ⚠️ 用 `year_globs()` 而不是写死 `year=*`：没有 db/ 时 DuckDB 会抛
+    `IOException: No files found`，而这里是 `try/finally`（没有 except），
+    异常会冒出去把调用方打挂 —— 包括 CI 里那些只用合成面板的测试。
+    数据集不存在时返回**空表**，让调用方走"无真实成分"的分支。
+    """
+    from database.config import connect_duckdb, year_globs
+    glob = year_globs(FROZEN_ROOT / "index_cons")
+    if glob == "[]":
+        return pd.DataFrame(columns=["trade_date", "code", "weight"])
     con = connect_duckdb()
     try:
         df = con.execute(f"""
             SELECT CAST(trade_date AS VARCHAR) AS trade_date, con_code, weight
-            FROM read_parquet('{glob}')
+            FROM read_parquet({glob})
             WHERE index_code = ?
         """, [index_code]).fetchdf()
     finally:

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """测试：指标计算"""
-import sys, io, os
+import sys
+import io
+import os
 # 不在 import 阶段替换 sys.stdout（会破坏 pytest 的输出捕获，见 test_loader.py 注释）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

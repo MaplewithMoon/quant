@@ -28,9 +28,16 @@
     不加 --walk-forward 时，结果是"在同一段历史上挑出来的最好看的数字"，
     必然含数据窥探偏差。脚本会在结尾给出明确警告。
 """
-import sys, io, json, argparse
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import sys
+import io
+import json
+import argparse
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import pandas as pd
 

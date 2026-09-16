@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """测试：数据加载与复权"""
-import sys, io, os
+import sys
+import io
+import os
 # 不要在 import 阶段替换 sys.stdout：pytest 会在导入时接管 stdout，
 # 替换后其捕获机制会抛 "ValueError: I/O operation on closed file"。
 # 脚本直跑时的编码修正放到文件末尾的 __main__ 分支里。

@@ -80,10 +80,8 @@ def test_member_panel_uses_past_snapshot_only():
     if len(snaps) < 3:
         print("[SKIP] 快照太少")
         return
-    s0, s1, s2 = snaps[-3], snaps[-2], snaps[-1]
+    s0, s2 = snaps[-3], snaps[-1]
     codes = sorted(members["code"].unique())
-    # 取一个位于 s0 与 s1 之间（若没有则取 s0 当天）的交易日
-    mid = s0 if s0 == pd.Timestamp(s0) else s0
     m = index_member_panel("000300.SH", pd.DatetimeIndex([s0]), codes)
     ref = set(members[(members["trade_date"] == s0)]["code"])
     got = set(np.array(codes)[m.iloc[0].values])
@@ -102,7 +100,7 @@ def test_universe_filters_reduce_mask():
     p = _panel(n_days=120, n_codes=50)
     base = build_universe(p, UniverseSpec())
     assert base.shape == p["close"].shape
-    assert base.dtypes.iloc[0] == bool
+    assert pd.api.types.is_bool_dtype(base.dtypes.iloc[0])
 
     listed = build_universe(p, UniverseSpec(min_listed_days=60))
     assert listed.sum().sum() <= base.sum().sum(), "上市天数过滤不应放宽股票池"

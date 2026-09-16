@@ -105,7 +105,6 @@ class PortfolioBacktestEngine:
         """
         close = panel["close"]
         opn = panel.get("open", close)
-        volume = panel.get("volume")
 
         dates = close.index
         codes = list(close.columns)

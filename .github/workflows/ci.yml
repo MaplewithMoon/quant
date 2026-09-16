@@ -42,10 +42,10 @@ jobs:
 
     steps:
       - name: 拉取代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 安装 Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip                        # 按 pyproject.toml 缓存依赖，加速后续运行
@@ -76,17 +76,22 @@ jobs:
         run: python scripts/run_tests.py
 
   # ---------------------------------------------------------------------------
-  #  静态检查：只报告，不阻断（continue-on-error）
-  #  现有代码还有不少未使用导入等问题，等清理干净后再把 continue-on-error 去掉，
-  #  它就会变成真正的门禁。
+  #  静态检查：**门禁**（2026-09 起不再是 continue-on-error）
+  #
+  #  规则集很窄，只开"能抓真 bug"的：E4/E7/E9（语法与语句层面）+ F（pyflakes：
+  #  未定义名字、未使用变量/导入）。F401（未使用导入）仍然 ignore。
+  #
+  #  聚宽原样移植的策略文件（strategies/jq/*.py）在文件头用
+  #  `# ruff: noqa: F405, F841, E711, E712` 单独豁免，理由写在文件里：
+  #  策略主体必须与聚宽原版逐行一致（`== None` 在 pandas 里是元素级比较，
+  #  按 ruff 的建议改成 `is` 会改变语义）。
   # ---------------------------------------------------------------------------
   lint:
-    name: lint (non-blocking)
+    name: lint
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
       - name: 安装 ruff

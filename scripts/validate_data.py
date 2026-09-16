@@ -8,9 +8,15 @@
     python scripts/validate_data.py --check coverage # 只查覆盖率
     python scripts/validate_data.py --quick         # 抽样快速检查
 """
-import sys, io, json
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import sys
+import io
+import json
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import argparse
 import glob
@@ -726,7 +732,7 @@ def check_year_completeness():
     if sus_dir.exists():
         try:
             sg = f"{(sus_dir / 'year=2005' / '*.parquet').as_posix()}"
-            sdf = con2 = connect_duckdb()
+            sdf = connect_duckdb()
             sy = sdf.execute(f"""
                 SELECT code, year(strptime(trade_date, '%Y%m%d')) y, count(*) n
                 FROM read_parquet('{sg}')
@@ -741,10 +747,10 @@ def check_year_completeness():
     bad, explained = [], []
     for code in sorted(live):
         ys = years.get(code)
-        l = ld.get(code)
-        if not ys or pd.isna(l):
+        ldate = ld.get(code)
+        if not ys or pd.isna(ldate):
             continue
-        y0 = max(l.year, 2005)
+        y0 = max(ldate.year, 2005)
         exp = {y for y in range(y0, last_year + 1) if cd.get(y, 0) >= 20}
         exp.discard(y0)                       # 上市当年不完整属正常
         # 连续缺失年份要合并成**一段**再用两端之外的数据判定 ——

@@ -53,7 +53,7 @@ def test_expand_space_is_cartesian():
     combos2 = expand_space({"fast": (5, 7)})
     assert [c["fast"] for c in combos2] == [5, 6, 7]
     assert ParamSpace({"fast": [1, 2], "slow": (10, 12)}).size() == 6
-    print(f"[OK] 笛卡尔积展开: 4 组 / 整数区间 3 档 / size=6")
+    print("[OK] 笛卡尔积展开: 4 组 / 整数区间 3 档 / size=6")
 
 
 def test_sample_space_dedup_and_count():
@@ -115,7 +115,7 @@ def test_grid_search_sorted_and_annotated():
     assert list(df["_score"]) == sorted(df["_score"], reverse=True), "应按目标降序"
     assert df.attrs["n_trials"] == 4
     assert "⚠️" in overfit_warning(df)
-    print(f"[OK] 网格搜索: 4 组结果按夏普降序，附数据窥探提示")
+    print("[OK] 网格搜索: 4 组结果按夏普降序，附数据窥探提示")
 
 
 def test_random_search_count():

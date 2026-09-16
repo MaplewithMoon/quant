@@ -31,7 +31,9 @@
     # 输出 JSON（供其他程序/Web 消费）
     python scripts/backtest.py --symbol 000001 --strategy BBand --json
 """
-import sys, io, json
+import sys
+import io
+import json
 sys.path.insert(0, ".")
 
 import argparse
@@ -348,7 +350,7 @@ def main():
                                 key=lambda kv: -kv[1]):
             print(f"    {n:>4} 次  {reason}")
     if engine.pending_cancelled:
-        print(f"\n[制度约束] 最后 1 根 bar 的信号无下一根 bar 可成交，已作废")
+        print("\n[制度约束] 最后 1 根 bar 的信号无下一根 bar 可成交，已作废")
 
     logger.info(f"策略: {strategy.name}  交易次数: {len(trades)}")
     logger.info(f"回测结果:\n{fmt_metrics(metrics)}")

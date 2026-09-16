@@ -10,9 +10,16 @@
     python scripts/rebuild_cleaned.py            # 全量重建
     python scripts/rebuild_cleaned.py --verify   # 重建后校验
 """
-import sys, io, os, shutil
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import sys
+import io
+import os
+import shutil
 sys.path.insert(0, ".")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import argparse
 import pandas as pd
@@ -38,19 +45,19 @@ def clean_rows(df):
     # OHLC
     o = pd.to_numeric(df["open"], errors="coerce")
     h = pd.to_numeric(df["high"], errors="coerce")
-    l = pd.to_numeric(df["low"], errors="coerce")
+    lo = pd.to_numeric(df["low"], errors="coerce")
     cl = pd.to_numeric(df["close"], errors="coerce")
-    valid = o.notna() & h.notna() & l.notna() & cl.notna()
-    bad |= valid & ~(h >= l)
-    bad |= valid & ~(l <= o)
+    valid = o.notna() & h.notna() & lo.notna() & cl.notna()
+    bad |= valid & ~(h >= lo)
+    bad |= valid & ~(lo <= o)
     bad |= valid & ~(o <= h)
-    bad |= valid & ~(l <= cl)
+    bad |= valid & ~(lo <= cl)
     bad |= valid & ~(cl <= h)
     # 三角校验（VWAP 落在 [low,high]）
     amt = pd.to_numeric(df["amount"], errors="coerce")
     vwap = amt / vol.replace(0, pd.NA)
     vok = vwap.notna() & valid
-    bad |= vok & ~((vwap >= l * 0.95) & (vwap <= h * 1.05))
+    bad |= vok & ~((vwap >= lo * 0.95) & (vwap <= h * 1.05))
     return df[~bad], int(bad.sum())
 
 

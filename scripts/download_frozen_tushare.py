@@ -13,7 +13,9 @@
     python scripts/download_frozen_tushare.py                   # 全量
     python scripts/download_frozen_tushare.py --only adjust --codes 000001,600519
 """
-import sys, io, os
+import sys
+import io
+import os
 sys.path.insert(0, ".")
 
 import argparse
@@ -72,14 +74,19 @@ def download_adjust(pro, codes):
                               ts_code=ts_code_of(code),
                               start_date=f"{START_YEAR}0101", end_date="20500101")
                 if df is None or df.empty:
-                    done.add(code); save_ckpt("adjust", done); pbar.update(1); continue
+                    done.add(code)
+                    save_ckpt("adjust", done)
+                    pbar.update(1)
+                    continue
                 df["trade_date"] = pd.to_datetime(df["trade_date"])
                 df["code"] = code
                 save_by_year(df, "adjust", code)
-                done.add(code); save_ckpt("adjust", done)
+                done.add(code)
+                save_ckpt("adjust", done)
             except Exception as e:
                 print(f"  {code} 失败: {str(e)[:50]}", flush=True)
-            pbar.set_postfix(code=code); pbar.update(1)
+            pbar.set_postfix(code=code)
+            pbar.update(1)
 
 
 # ============ st: tushare namechange（原始） ============
@@ -94,16 +101,21 @@ def download_st(pro, codes):
             try:
                 df = api_call(pro, "namechange", limiter, ts_code=ts_code_of(code))
                 if df is None or df.empty:
-                    done.add(code); save_ckpt("st", done); pbar.update(1); continue
+                    done.add(code)
+                    save_ckpt("st", done)
+                    pbar.update(1)
+                    continue
                 df["code"] = code
                 if "start_date" in df.columns:
                     df["start_date"] = pd.to_datetime(df["start_date"])
                 (FROZEN / "st" / "year=2005").mkdir(parents=True, exist_ok=True)
                 df.to_parquet(FROZEN / "st" / "year=2005" / f"{code}.parquet", index=False)
-                done.add(code); save_ckpt("st", done)
+                done.add(code)
+                save_ckpt("st", done)
             except Exception as e:
                 print(f"  {code} 失败: {str(e)[:50]}", flush=True)
-            pbar.set_postfix(code=code); pbar.update(1)
+            pbar.set_postfix(code=code)
+            pbar.update(1)
 
 
 # ============ valuation: tushare daily_basic（原始单位） ============
@@ -121,14 +133,19 @@ def download_valuation(pro, codes):
                               start_date=f"{START_YEAR}0101", end_date="20500101",
                               fields="trade_date,pe,pe_ttm,pb,ps,ps_ttm,total_mv,circ_mv,turnover_rate")
                 if df is None or df.empty:
-                    done.add(code); save_ckpt("valuation", done); pbar.update(1); continue
+                    done.add(code)
+                    save_ckpt("valuation", done)
+                    pbar.update(1)
+                    continue
                 df["trade_date"] = pd.to_datetime(df["trade_date"])
                 df["code"] = code
                 save_by_year(df, "valuation", code)
-                done.add(code); save_ckpt("valuation", done)
+                done.add(code)
+                save_ckpt("valuation", done)
             except Exception as e:
                 print(f"  {code} 失败: {str(e)[:50]}", flush=True)
-            pbar.set_postfix(code=code); pbar.update(1)
+            pbar.set_postfix(code=code)
+            pbar.update(1)
 
 
 # ============ etf: tushare fund_basic + fund_daily ============
@@ -152,15 +169,17 @@ def download_etf(pro):
     with tqdm(total=len(dates), desc="etf日线", ncols=100) as pbar:
         for d in dates:
             if d in done:
-                pbar.update(1); continue
+                pbar.update(1)
+                continue
             check_disk()
             try:
                 df = api_call(pro, "fund_daily", limiter, trade_date=d)
                 if df is not None and not df.empty:
                     df["trade_date"] = pd.to_datetime(d)
                     save_by_year(df, "etf")
-                done.add(d); save_ckpt("etf", done)
-            except Exception as e:
+                done.add(d)
+                save_ckpt("etf", done)
+            except Exception:
                 pass
             pbar.update(1)
     print(f"[etf] 完成 {len(done)} 个交易日", flush=True)
@@ -184,15 +203,17 @@ def download_options(pro):
     with tqdm(total=len(dates), desc="options日线", ncols=100) as pbar:
         for d in dates:
             if d in done:
-                pbar.update(1); continue
+                pbar.update(1)
+                continue
             check_disk()
             try:
                 df = api_call(pro, "opt_daily", limiter, trade_date=d)
                 if df is not None and not df.empty:
                     df["trade_date"] = pd.to_datetime(d)
                     save_by_year(df, "options")
-                done.add(d); save_ckpt("options", done)
-            except Exception as e:
+                done.add(d)
+                save_ckpt("options", done)
+            except Exception:
                 pass
             pbar.update(1)
     print(f"[options] 完成 {len(done)} 个交易日", flush=True)

@@ -68,11 +68,18 @@ def _tmpdir():
     return d
 
 
-def test_panel_cache_roundtrip_and_invalidation(tmp_path):
-    """面板缓存：指纹一致则命中；底层数据一变则拒绝复用"""
+def test_panel_cache_roundtrip_and_invalidation():
+    """面板缓存：指纹一致则命中；底层数据一变则拒绝复用
+
+    ⚠️ 不用 pytest 的 `tmp_path` fixture：它建在**系统临时目录**下，在受限
+    环境（沙箱/部分 CI）里会 PermissionError，而且那样这个文件就只能在
+    pytest 下跑、不能用 `python tests/xxx.py` 独立跑。统一用项目内的
+    `_tmpdir()`（与 test_storage.py 同一套做法）。
+    """
     import backtest.panel_data as pdata
     import database.provenance as prov
 
+    tmp_path = _tmpdir()
     idx = pd.bdate_range("2024-01-02", "2024-01-31")
     panel = {
         "close": pd.DataFrame(1.0, index=idx, columns=["600000", "000001"]),
@@ -111,7 +118,7 @@ def test_panel_cache_roundtrip_and_invalidation(tmp_path):
     print("[OK] 面板缓存：指纹一致命中 / 数据变更失效 / 无指纹旧缓存作废")
 
 
-def test_year_globs_only_lists_existing_partitions(tmp_path):
+def test_year_globs_only_lists_existing_partitions():
     """分区 glob 只能列**真实存在**的分区
 
     这是"停牌面板静默为空"那个 bug 的根因回归：旧实现按区间硬拼 year=YYYY，
@@ -119,6 +126,8 @@ def test_year_globs_only_lists_existing_partitions(tmp_path):
     IOException -> 被 except Exception 吞掉 -> 数据静默变空。
     """
     from database.config import NON_ANNUAL_YEAR, year_globs
+
+    tmp_path = _tmpdir()          # 同上：不用 pytest 的 tmp_path fixture
 
     # 静态数据集：只有占位分区，任何区间都必须落到它上面
     static = tmp_path / "static"
@@ -170,7 +179,8 @@ def test_suspend_panel_actually_loads():
     assert s.values.any(), "停牌面板全是 False，说明没读到任何停牌记录"
     # 真实管线会走 align_to：缺失（NaN=未停牌）补 False 并转 bool
     s = pdata.align_to(out, s.index, s.columns)["suspended"]
-    assert (s.dtypes == bool).all(), f"align_to 后必须是 bool，实得 {set(s.dtypes)}"
+    assert all(pd.api.types.is_bool_dtype(t) for t in s.dtypes), \
+        f"align_to 后必须是 bool，实得 {set(s.dtypes)}"
     # 停牌只发生在交易日（S 记录本身只罗列交易日）
     assert all(d.weekday() < 5 for d in s.index), "停牌面板出现了周末，日期解析有问题"
     # 复牌日（suspend_type='R'）不应被当成停牌日
@@ -247,16 +257,10 @@ def test_parse_tushare_date_handles_mixed_formats():
 
 
 if __name__ == "__main__":
-    import shutil
-
     test_fingerprint_changed_detects_mtime_and_count()
     test_parse_tushare_date_handles_mixed_formats()
-    td = _tmpdir()
-    try:
-        test_panel_cache_roundtrip_and_invalidation(td)
-        test_year_globs_only_lists_existing_partitions(td)
-    finally:
-        shutil.rmtree(td, ignore_errors=True)
+    test_panel_cache_roundtrip_and_invalidation()
+    test_year_globs_only_lists_existing_partitions()
     test_suspend_panel_actually_loads()
     test_panel_deps_cover_everything_load_panel_reads()
     print("\n全部数据指纹/缓存失效测试通过")

@@ -267,7 +267,7 @@ class FactorReport:
                 L.append("       此时应以中位数/秩 IC 为准，或改用截尾均值，不要直接按均值下结论。")
         if not self.turnover.empty:
             L.append("")
-            L.append(f"  —— 换手率 ——")
+            L.append("  —— 换手率 ——")
             L.append(f"    平均分层换手: {self.turnover.mean():>8.2%}   "
                      f"（越高交易成本压力越大）")
         if not self.decay.empty:

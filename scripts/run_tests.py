@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 """运行全部单元测试（也可用 pytest）"""
-import sys, io, os
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+import sys
+import io
+import os
 sys.path.insert(0, ".")
 sys.path.insert(0, "tests")
+if __name__ == "__main__":
+    # 只在直接运行时切编码：模块顶层替换 sys.stdout 是有副作用的 import，
+    # 会破坏 pytest 的输出捕获（详见 utils/console.py）
+    from utils.console import force_utf8_stdout
+    force_utf8_stdout()
 
 import subprocess
 import sys

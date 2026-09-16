@@ -76,8 +76,8 @@ def vol_60(panel):
 def amp_20(panel):
     c = _close(panel)
     h = panel.get("high_adj", panel.get("high"))
-    l = panel.get("low_adj", panel.get("low"))
-    amp = (h - l) / c.shift(1)
+    lo = panel.get("low_adj", panel.get("low"))
+    amp = (h - lo) / c.shift(1)
     return amp.rolling(20).mean()
 
 
