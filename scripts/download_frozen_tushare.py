@@ -19,7 +19,7 @@ import os
 sys.path.insert(0, ".")
 
 import argparse
-import json
+
 from pathlib import Path
 import pandas as pd
 import tushare as ts
@@ -32,24 +32,41 @@ FROZEN = DB / "frozen"
 START_YEAR = 2005
 
 
-def ckpt_path(dataset):
-    return FROZEN / dataset / "_checkpoint.json"
+def _store(dataset):
+    """断点统一走 `database.storage.Storage`（**唯一实现**）
+
+    旧实现在这里自己读写 `_checkpoint.json`，问题有两个：
+      1. `write_text` **非原子**（断电会写坏，而 Storage 那边做了原子写 + 损坏容错）
+      2. 只写 `{"done": [...]}`，会把 `Storage` 记的 `spans` 等键**整个抹掉**
+    两套实现写同一个文件，迟早互相踩。现在统一。
+    """
+    from database.storage import Storage
+    return Storage(dataset, allow_frozen=True)
 
 
-def load_ckpt(dataset):
-    p = ckpt_path(dataset)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {"done": []}
+def done_set(dataset) -> set:
+    return set(_store(dataset).load_checkpoint().get("done", []))
 
 
-def save_ckpt(dataset, done):
-    (FROZEN / dataset).mkdir(parents=True, exist_ok=True)
-    ckpt_path(dataset).write_text(json.dumps({"done": sorted(done)}), encoding="utf-8")
+def mark(dataset, key, df=None, empty=False):
+    """标记完成：能取到日期范围就记下来（B4 靠它发现"数据只到某年"的静默截断）"""
+    st = _store(dataset)
+    span = None
+    if df is not None and len(df) and "trade_date" in df.columns:
+        s = pd.to_datetime(df["trade_date"], errors="coerce").dropna()
+        if len(s):
+            span = (s.min(), s.max())
+    st.mark_done(key, span=span, empty=empty if span is None else False)
 
 
 def save_by_year(df, dataset, code=None):
-    """按年分区保存到 frozen/{dataset}/year={Y}/"""
+    """按年分区保存到 frozen/{dataset}/year={Y}/
+
+    ⚠️ **`code` 为 None 时一律写 `data.parquet`，同一年的第二次调用会覆盖第一次**
+    —— `etf`/`options` 就是被这个坑掉的：它们按"每天一个 trade_date"下载，
+    结果每年只剩最后一次成功日期的数据（实测 2020~2026 每年各 1 天）。
+    这类"按日期"的数据集必须传 `code=<日期>` 分开存。
+    """
     df["year"] = df["trade_date"].dt.year
     for y, g in df.groupby("year"):
         if y < START_YEAR:
@@ -63,7 +80,7 @@ def save_by_year(df, dataset, code=None):
 # ============ adjust: tushare adj_factor（原始） ============
 def download_adjust(pro, codes):
     limiter = RateLimiter()
-    done = set(load_ckpt("adjust")["done"])
+    done = done_set("adjust")
     todo = [c for c in codes if c not in done]
     print(f"[adjust] 待下 {len(todo)} 只", flush=True)
     with tqdm(total=len(todo), desc="adjust", ncols=100) as pbar:
@@ -74,15 +91,13 @@ def download_adjust(pro, codes):
                               ts_code=ts_code_of(code),
                               start_date=f"{START_YEAR}0101", end_date="20500101")
                 if df is None or df.empty:
-                    done.add(code)
-                    save_ckpt("adjust", done)
+                    mark("adjust", code, empty=True)
                     pbar.update(1)
                     continue
                 df["trade_date"] = pd.to_datetime(df["trade_date"])
                 df["code"] = code
                 save_by_year(df, "adjust", code)
-                done.add(code)
-                save_ckpt("adjust", done)
+                mark("adjust", code, df)
             except Exception as e:
                 print(f"  {code} 失败: {str(e)[:50]}", flush=True)
             pbar.set_postfix(code=code)
@@ -92,7 +107,7 @@ def download_adjust(pro, codes):
 # ============ st: tushare namechange（原始） ============
 def download_st(pro, codes):
     limiter = RateLimiter()
-    done = set(load_ckpt("st")["done"])
+    done = done_set("st")
     todo = [c for c in codes if c not in done]
     print(f"[st] 待下 {len(todo)} 只", flush=True)
     with tqdm(total=len(todo), desc="st", ncols=100) as pbar:
@@ -101,8 +116,7 @@ def download_st(pro, codes):
             try:
                 df = api_call(pro, "namechange", limiter, ts_code=ts_code_of(code))
                 if df is None or df.empty:
-                    done.add(code)
-                    save_ckpt("st", done)
+                    mark("st", code, empty=True)
                     pbar.update(1)
                     continue
                 df["code"] = code
@@ -110,8 +124,11 @@ def download_st(pro, codes):
                     df["start_date"] = pd.to_datetime(df["start_date"])
                 (FROZEN / "st" / "year=2005").mkdir(parents=True, exist_ok=True)
                 df.to_parquet(FROZEN / "st" / "year=2005" / f"{code}.parquet", index=False)
-                done.add(code)
-                save_ckpt("st", done)
+                # namechange 没有 trade_date，用 start_date 作为"数据范围"
+                _s = (pd.to_datetime(df["start_date"], errors="coerce").dropna()
+                      if "start_date" in df.columns else None)
+                _store("st").mark_done(
+                    code, span=(_s.min(), _s.max()) if _s is not None and len(_s) else None)
             except Exception as e:
                 print(f"  {code} 失败: {str(e)[:50]}", flush=True)
             pbar.set_postfix(code=code)
@@ -121,7 +138,7 @@ def download_st(pro, codes):
 # ============ valuation: tushare daily_basic（原始单位） ============
 def download_valuation(pro, codes):
     limiter = RateLimiter()
-    done = set(load_ckpt("valuation")["done"])
+    done = done_set("valuation")
     todo = [c for c in codes if c not in done]
     print(f"[valuation] 待下 {len(todo)} 只", flush=True)
     with tqdm(total=len(todo), desc="valuation", ncols=100) as pbar:
@@ -133,90 +150,86 @@ def download_valuation(pro, codes):
                               start_date=f"{START_YEAR}0101", end_date="20500101",
                               fields="trade_date,pe,pe_ttm,pb,ps,ps_ttm,total_mv,circ_mv,turnover_rate")
                 if df is None or df.empty:
-                    done.add(code)
-                    save_ckpt("valuation", done)
+                    mark("valuation", code, empty=True)
                     pbar.update(1)
                     continue
                 df["trade_date"] = pd.to_datetime(df["trade_date"])
                 df["code"] = code
                 save_by_year(df, "valuation", code)
-                done.add(code)
-                save_ckpt("valuation", done)
+                mark("valuation", code, df)
             except Exception as e:
                 print(f"  {code} 失败: {str(e)[:50]}", flush=True)
             pbar.set_postfix(code=code)
             pbar.update(1)
 
 
-# ============ etf: tushare fund_basic + fund_daily ============
-def download_etf(pro):
+# ============ etf / options：按**真实交易日**下全市场快照 ============
+def _download_by_trading_days(pro, dataset: str, api: str, desc: str,
+                              calls_per_min: int, start_year: int = 2020):
+    """按交易日逐日下载全市场快照，**每天一个文件**
+
+    ⚠️ 旧实现有三个错，直接导致 `frozen/etf` 与 `frozen/options` 废掉：
+      1. 取数日期用"每月 1 号"，而 1 号经常不是交易日 -> 大量空响应；
+      2. 空响应也会 `done.add(d)` -> **永久不再重试**（B4 的真实案例）；
+      3. `save_by_year(df, ds)` 不传 code，每年都写同一个 `data.parquet`
+         -> 后一天覆盖前一天，实测 2020~2026 每年只剩 1 天数据。
+    现在：从 `database.calendar.trading_days()` 取真实交易日；**只有真的写出
+    数据才标完成并记范围**；每天写 `year={Y}/{日期}.parquet`，互不覆盖。
+    """
     limiter = RateLimiter()
-    done = set(load_ckpt("etf")["done"])
+    store = _store(dataset)
+    done = done_set(dataset)
+    from database.calendar import trading_days
+    days = [d for d in trading_days(start=f"{start_year}-01-01")]
+    todo = [d for d in days if d.strftime("%Y%m%d") not in done]
+    print(f"[{dataset}] 交易日 {len(days)} 个，待下 {len(todo)} 个", flush=True)
+    n_empty = 0
+    with tqdm(total=len(todo), desc=desc, ncols=100) as pbar:
+        for d in todo:
+            key = d.strftime("%Y%m%d")
+            check_disk()
+            try:
+                df = api_call(pro, api, limiter, trade_date=key)
+                if df is None or df.empty:
+                    # **不标完成**：交易日却拿不到数据，下次还要重试
+                    n_empty += 1
+                else:
+                    df = df.copy()
+                    df["trade_date"] = pd.to_datetime(d.strftime("%Y-%m-%d"))
+                    save_by_year(df, dataset, code=d.strftime("%Y-%m-%d"))
+                    store.mark_done(key, span=(d, d))
+            except Exception as e:
+                print(f"  {key} 失败: {str(e)[:50]}", flush=True)
+            pbar.set_postfix(day=key)
+            pbar.update(1)
+    if n_empty:
+        print(f"[{dataset}] 有 {n_empty} 个交易日返回空 —— 未标记完成，"
+              f"下次运行会重试（空响应 != 确认无数据）", flush=True)
+    print(f"[{dataset}] 完成 {len(done_set(dataset))} 个交易日", flush=True)
+
+
+def download_etf(pro):
     (FROZEN / "etf").mkdir(parents=True, exist_ok=True)
     try:
-        basic = api_call(pro, "fund_basic", limiter, market="E", status="L")
+        basic = api_call(pro, "fund_basic", RateLimiter(), market="E", status="L")
         basic.to_parquet(FROZEN / "etf" / "fund_basic.parquet", index=False)
         print(f"[etf] 基金列表: {len(basic)} 只", flush=True)
     except Exception as e:
         print(f"[etf] 基金列表失败: {str(e)[:60]}", flush=True)
-    # 按交易日下全市场基金日线（fund_daily 按 trade_date 返回全部）
-    import datetime
-    today = datetime.date.today()
-    dates = []
-    for y in range(2020, today.year + 1):
-        for m in range(1, 13):
-            dates.append(f"{y}{m:02d}01")
-    with tqdm(total=len(dates), desc="etf日线", ncols=100) as pbar:
-        for d in dates:
-            if d in done:
-                pbar.update(1)
-                continue
-            check_disk()
-            try:
-                df = api_call(pro, "fund_daily", limiter, trade_date=d)
-                if df is not None and not df.empty:
-                    df["trade_date"] = pd.to_datetime(d)
-                    save_by_year(df, "etf")
-                done.add(d)
-                save_ckpt("etf", done)
-            except Exception:
-                pass
-            pbar.update(1)
-    print(f"[etf] 完成 {len(done)} 个交易日", flush=True)
+    _download_by_trading_days(pro, "etf", "fund_daily", "etf日线",
+                              calls_per_min=20)
 
 
-# ============ options: tushare opt_basic + opt_daily ============
 def download_options(pro):
-    limiter = RateLimiter()
-    done = set(load_ckpt("options")["done"])
     (FROZEN / "options").mkdir(parents=True, exist_ok=True)
     try:
-        basic = api_call(pro, "opt_basic", limiter, exchange="SSE")
+        basic = api_call(pro, "opt_basic", RateLimiter(), exchange="SSE")
         basic.to_parquet(FROZEN / "options" / "opt_basic.parquet", index=False)
         print(f"[options] 合约列表: {len(basic)} 个", flush=True)
     except Exception as e:
         print(f"[options] 合约列表失败: {str(e)[:60]}", flush=True)
-    # 按交易日下全市场期权（opt_daily 按 trade_date）
-    import datetime
-    today = datetime.date.today()
-    dates = [f"{y}{m:02d}01" for y in range(2020, today.year + 1) for m in range(1, 13)]
-    with tqdm(total=len(dates), desc="options日线", ncols=100) as pbar:
-        for d in dates:
-            if d in done:
-                pbar.update(1)
-                continue
-            check_disk()
-            try:
-                df = api_call(pro, "opt_daily", limiter, trade_date=d)
-                if df is not None and not df.empty:
-                    df["trade_date"] = pd.to_datetime(d)
-                    save_by_year(df, "options")
-                done.add(d)
-                save_ckpt("options", done)
-            except Exception:
-                pass
-            pbar.update(1)
-    print(f"[options] 完成 {len(done)} 个交易日", flush=True)
+    _download_by_trading_days(pro, "options", "opt_daily", "options日线",
+                              calls_per_min=15)
 
 
 def main():
@@ -243,9 +256,7 @@ def main():
 
     if args.fresh:
         for ds in ["adjust", "st", "valuation", "etf", "options"]:
-            p = ckpt_path(ds)
-            if p.exists():
-                p.unlink()
+            # 断点文件就在数据集目录里，删目录时一并清掉；不依赖已删除的 ckpt_path()
             d = FROZEN / ds
             if d.exists():
                 import shutil as _sh

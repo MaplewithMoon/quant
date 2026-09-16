@@ -99,7 +99,7 @@ class ValuationDownloader(BaseDownloader):
             df = self._from_baidu(code)
 
         if df.empty:
-            self.storage.mark_done(code)
+            self.storage.mark_done(code, empty=True)
             return df
 
         df["year"] = df["trade_date"].dt.year
@@ -108,7 +108,7 @@ class ValuationDownloader(BaseDownloader):
                 continue
             self.save_year(g.drop(columns="year"), year=int(y), code=code, force=True)
 
-        self.storage.mark_done(code)
+        self.storage.mark_done(code, span=self._span_of(df))
         return df
 
     def download(self, codes: list = None, resume: bool = True):

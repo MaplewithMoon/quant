@@ -65,6 +65,24 @@ class BaseDownloader:
     def save_year(self, df, year, code=None, force=False):
         self.storage.save(df, year=year, code=code, force=force)
 
+    @staticmethod
+    def _span_of(df, col: str = "trade_date"):
+        """取 DataFrame 的日期范围，供 `storage.mark_done(span=...)` 记录
+
+        B4：断点光记"某只股票完成了"不够 —— tushare 半路返回一截历史时同样是
+        "成功"，之后永远不会再补。把**实际写出去的数据范围**记下来，
+        `storage.audit_done()` 才能发现"断点说完成了，数据却只到 2015 年"。
+        取不到日期列时返回 None（标记为"范围未知"，不假装知道）。
+        """
+        if df is None or len(df) == 0:
+            return None
+        for c in (col, "end_date", "ann_date", "suspend_date"):
+            if c in df.columns:
+                s = pd.to_datetime(df[c], errors="coerce").dropna()
+                if len(s):
+                    return (s.min(), s.max())
+        return None
+
     # ---------- 子类需实现 ----------
     def download(self, *args, **kwargs):
         raise NotImplementedError

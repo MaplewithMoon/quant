@@ -49,7 +49,8 @@ class FinancialDownloader(BaseDownloader):
                 result[sheet] = df
             except Exception as e:
                 self.logger.warning(f"{code} {sheet} 失败: {str(e)[:50]}")
-        self.storage.mark_done(code)
+        # 三张报表至少写成功一张才算完成；一张都没有 -> 记为确认无数据
+        self.storage.mark_done(code, empty=not result)
         return result
 
     def download(self, codes: list = None, resume: bool = True):

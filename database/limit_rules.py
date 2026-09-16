@@ -123,26 +123,14 @@ _CAL_CACHE: Dict[str, object] = {}
 
 
 def trading_calendar() -> pd.DatetimeIndex:
-    """全市场交易日（frozen/calendar；该表只存开市日，仍按 is_open 过滤防御）"""
-    if "cal" in _CAL_CACHE:
-        return _CAL_CACHE["cal"]
-    from database.config import FROZEN_ROOT, connect_duckdb, year_globs
-    cal = pd.DatetimeIndex([])
-    d = FROZEN_ROOT / "calendar"
-    if d.exists():
-        g = year_globs(d)
-        if g != "[]":
-            con = connect_duckdb()
-            try:
-                df = con.execute(f"""
-                    SELECT DISTINCT trade_date FROM read_parquet({g})
-                    WHERE try_cast(is_open AS INTEGER) IS NULL
-                       OR try_cast(is_open AS INTEGER) = 1
-                    ORDER BY 1
-                """).fetchdf()
-                cal = pd.DatetimeIndex(pd.to_datetime(df["trade_date"]))
-            finally:
-                con.close()
+    """全市场交易日（**唯一实现在 database/calendar.py**）
+
+    ⚠️ 返回的是**已裁剪到今天**的日历。`frozen/calendar` 本身含未来占位日
+    （到 2027-12-31），把它当"已发生的交易日"用会出错 —— 详见
+    `database/calendar.py` 的模块文档。
+    """
+    from database.calendar import trading_days
+    cal = trading_days()
     _CAL_CACHE["cal"] = cal
     return cal
 

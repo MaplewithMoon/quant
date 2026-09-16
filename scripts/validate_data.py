@@ -246,17 +246,94 @@ def check_column_consistency():
            f"{len(bad)} 个数据集出现**未声明**的列集分裂" if bad else
            f"{checked} 个数据集均一致（{len(MULTI_SCHEMA_DECLARED)} 个已声明的分裂）")
 
+
+# ============================================================
+# 2c. 交易日历（B15）
+# ============================================================
+def check_calendar():
+    """交易日历检查：**未来占位日不能被当成"已发生"**
+
+    `frozen/calendar` 来自 tushare `trade_cal`，天然包含未来交易日（实测到
+    2027-12-31）。把它当"已发生的交易日"用会安静地毁掉检查结论 ——
+    本项目已经真实发生过一次：`check_year_completeness` 用日历最大年份判定
+    "仍在上市"，2027 年没有数据，于是 `live` 为空、整条检查**空转通过**。
+
+    这条检查做三件事：
+      ① 日历本身干净（无重复、无周末、已排序）
+      ② 未来占位日的**边界**是明确的（从明天起连续，不是中间挖洞）
+      ③ 全库没有数据集把 `trade_date` 写到未来去（那是真的数据错误）
+    """
+    from database.calendar import calendar_meta, raw_calendar, trading_days
+    print("\n[交易日历] 未来占位日的边界与影响")
+
+    raw = raw_calendar()
+    meta = calendar_meta()
+    if len(raw) == 0:
+        report("交易日历非空", False, "frozen/calendar 无数据")
+        return
+    log(f"日历 {meta['n']:,} 个交易日：{str(meta['first'])[:10]} ~ {str(meta['last'])[:10]}")
+    log(f"  已发生 {meta['n'] - meta['n_future']:,} 天（至 {str(meta['last_past'])[:10]}），"
+        f"**未来占位 {meta['n_future']:,} 天**（{str(meta['future_first'])[:10]} 起）")
+    report("日历无重复", raw.is_unique, f"{len(raw) - raw.nunique()} 个重复日期")
+    n_out = int((raw[1:] <= raw[:-1]).sum())
+    report("日历严格递增", n_out == 0, f"{n_out} 处逆序")
+    # 周末不可能是交易日（tushare 的日历里确有极少数"周末调休交易日"，
+    # 例如春节前的周六补班 —— A 股实际上不交易，但历史上出现过，
+    # 所以这里只做提示、不作门禁）
+    wk = int((raw.dayofweek >= 5).sum())
+    if wk:
+        log(f"  ℹ 含 {wk} 个周六/周日（调休补班日，tushare 口径，仅提示）")
+
+    # ① 裁剪后的日历必须以"最新已发生交易日"结尾
+    clipped = trading_days()
+    report("默认取到的日历已裁剪（不含未来）",
+           len(clipped) == 0 or clipped.max() <= pd.Timestamp.now().normalize(),
+           f"裁剪后仍到 {clipped.max() if len(clipped) else '?'}")
+    # ② 未来占位段的**长度**要合理
+    #    ⚠️ 不要检查"未来段是否连续"：春节/国庆本来就有 8~10 天的空档，
+    #    那样写会稳定误报（第一版就误报了 3 处，全是长假）。
+    #    真正该守的是"不要长得离谱"（tushare 一般只公布到下一年的年底）。
+    report("未来占位段长度合理（≤500 个交易日）",
+           0 <= meta["n_future"] <= 500,
+           f"{meta['n_future']} 个未来交易日（到 {str(meta['last'])[:10]}）—— "
+           f"过长的日历多半是脏数据或年份占位")
+
+    # ③ 全库不许有 trade_date 落到未来（那才是真错误，不是日历问题）
+    from database.config import parquet_glob
+    today = pd.Timestamp.now().normalize()
+    con = connect_duckdb()
+    bad = []
+    for ds in ("daily",):
+        g = parquet_glob(dir_of(ds))
+        try:
+            n = con.execute(f"""SELECT count(*) FROM read_parquet('{g}')
+                                WHERE trade_date > ?""", [today]).fetchone()[0]
+        except Exception:
+            continue
+        if n:
+            bad.append(f"{ds}: {n} 行")
+    con.close()
+    for b in bad:
+        log(f"    ⚠ {b} 的 trade_date 超过了今天")
+    report("行情数据不含未来日期", not bad,
+           "；".join(bad) if bad else "daily_basic 无未来行")
+
+
 # ============================================================
 # 3. 覆盖率检查
 # ============================================================
 def _load_calendar():
-    files = list((DB / "frozen" / "calendar").rglob("*.parquet"))
-    if not files:
-        return pd.DataFrame()
-    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
-    df = df[df["is_open"] == 1] if "is_open" in df.columns else df
-    return df
+    """交易日历 —— 转调唯一实现 `database/calendar.py`
+
+    ⚠️ 必须用**裁剪版**（不含未来占位日）。`frozen/calendar` 覆盖到
+    2027-12-31，早期直接拿它当分母/判据，出现过"覆盖率检查空转、
+    完整性检查假通过"。要完整日历请显式用 `database.calendar.raw_calendar()`。
+    """
+    from database.calendar import trading_days
+    cal = trading_days()
+    if len(cal) == 0:
+        return pd.DataFrame(columns=["trade_date", "is_open"])
+    return pd.DataFrame({"trade_date": cal, "is_open": 1})
 
 def _load_stocks():
     files = list((DB / "frozen" / "stocks").rglob("*.parquet"))
@@ -680,11 +757,12 @@ def check_year_completeness():
         return
     stk["code"] = stk["code"].astype(str).str.zfill(6)
     ld = dict(zip(stk["code"], pd.to_datetime(stk["list_date"], errors="coerce")))
-    gcal = f"{(FROZEN_ROOT / 'calendar').as_posix()}/year=*/*.parquet"
-    cal = con.execute(f"""SELECT year(trade_date) y,
-        sum(CASE WHEN is_open=1 THEN 1 ELSE 0 END) d
-        FROM read_parquet('{gcal}') GROUP BY 1""").fetchdf()
-    cd = dict(zip(cal["y"].astype(int), cal["d"].astype(int)))
+    # 各年开市日数 —— 取自**裁剪版**日历（不含未来占位日），否则 2027 这种
+    # 没有数据的年份会混进分母，把整年缺口的判据带偏。
+    from database.calendar import trading_days
+    _cal = trading_days()
+    _s = pd.Series(1, index=_cal).groupby(_cal.year).sum()
+    cd = {int(y): int(n) for y, n in _s.items()}
 
     from collections import defaultdict
     # 用 DuckDB 一次聚合出每个 (code, year) 的交易日范围：
@@ -953,15 +1031,457 @@ def check_date_columns():
 
 
 # ============================================================
+# 7. 数据新鲜度与消费方（B12）
+# ============================================================
+# 每个数据集的"新鲜度预算"：`(类型说明, 提示阈值, 硬失败阈值)`，单位=天
+#
+# 为什么分两级：
+#   **提示阈值** = 期望的更新节奏。落后超过它就说明该更新了 —— 但"数据还没更新"
+#                 是**运维状态**，不是数据错误，不该让 `--check all` 永久变红
+#                 （那会让人对告警麻木，反而漏掉真问题）。
+#   **硬失败阈值** = 结构性损坏。日频数据落后两个月，那不是"没更新"而是
+#                 **下载坏了** —— `etf`/`options` 正是如此（每年只剩 1 天数据）。
+# 基准是 `database.calendar.latest_trading_day()`，**不是日历最大日期**
+# （那个是未来占位日，见 B15 与 `--check calendar`）。
+FRESHNESS_BUDGET = {
+    # dataset:        (类型,          提示, 硬失败)
+    "daily_raw": ("日频", 7, 60), "valuation": ("日频", 7, 60),
+    "adjust": ("日频", 7, 60), "index_daily": ("日频", 7, 60),
+    "fund_daily": ("日频", 7, 60), "margin": ("日频(全市场)", 7, 60),
+    "northbound": ("日频(全市场)", 7, 60), "futures": ("日频(全市场)", 7, 60),
+    "etf": ("月度快照", 45, 200), "options": ("月度快照", 45, 200),
+    "index_cons": ("月度快照", 45, 200),
+    "holders": ("季度", 150, 400), "financial": ("季度", 150, 400),
+    # 静态/事件流：没有"新鲜度"概念，不参与
+    "stocks": ("静态", None, None), "st": ("静态", None, None),
+    "suspend": ("静态", None, None), "industry": ("静态", None, None),
+    "dividend": ("事件流", None, None), "calendar": ("日历", None, None),
+}
+
+# 数据集 -> 用来判新鲜度的日期列（None = 自动挑第一个以 date 结尾的列）
+FRESHNESS_DATE_COL = {
+    "adjust": "trade_date", "valuation": "trade_date", "daily_raw": "trade_date",
+    "etf": "trade_date", "options": "trade_date", "futures": "trade_date",
+    "margin": "trade_date", "northbound": "trade_date",
+    "index_daily": "trade_date", "index_cons": "trade_date",
+    "fund_daily": "trade_date", "holders": "ann_date", "financial": "ann_date",
+    "st": "start_date", "stocks": "list_date", "industry": "list_date",
+}
+
+
+def _max_date_of(ds_dir, col=None, tail_partitions: int = 2):
+    """数据集里日期列的最大值
+
+    ⚠️ 两个必须做对的地方（第一版审计脚本两处都踩了）：
+      1. `YYYYMMDD` 是 VARCHAR，`try_cast(... AS TIMESTAMP)` 会**全变 NULL**，
+         只剩 ISO 格式那几行能显示 —— 于是 `holders` 被误报成"落后 411 天"。
+         必须 `try_strptime` + ISO 兜底。
+      2. 年度数据集不必全扫：最大值必在末尾分区里。静态数据集（只有一个
+         `year=2005`）只能全扫，数据量不大。
+    """
+    import os
+    from database.config import connect_duckdb
+    yds = sorted(ds_dir.glob("year=*"))
+    if not yds:
+        return None, None
+    if len(yds) > tail_partitions:
+        yds = yds[-tail_partitions:]
+    g = "[" + ", ".join(f"'{y.as_posix()}/*.parquet'" for y in yds) + "]"
+    cand = None
+    for yd in sorted(ds_dir.glob("year=*")):
+        fs = list(yd.glob("*.parquet"))
+        if fs:
+            cand = fs[0]
+            break
+    if cand is None:
+        return None, col
+    con = connect_duckdb()
+    try:
+        cols = con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{cand.as_posix()}')").fetchdf()
+        names = list(cols["column_name"])
+        if col is None:
+            col = next((c for c in names if c.lower().endswith("date")), None)
+        if col is None or col not in names:
+            return None, col
+        ty = cols[cols["column_name"] == col].iloc[0]["column_type"]
+        expr = (f"coalesce(try_strptime({col}, '%Y%m%d'), "
+                f"try_cast({col} AS TIMESTAMP))" if "VARCHAR" in ty
+                else f"try_cast({col} AS TIMESTAMP)")
+        r = con.execute(f"SELECT max({expr}) FROM read_parquet({g})").fetchone()
+        return (pd.Timestamp(r[0]) if r and r[0] is not None else None), col
+    except Exception:
+        return None, col
+    finally:
+        con.close()
+
+
+def _dataset_readers(ds: str) -> list:
+    """哪些项目源码**真的在读**这个数据集（路径级匹配）
+
+    ⚠️ 不能按裸词匹配：`margin` 会命中 CSS/HTML 里的 `margin:`，`options`
+    会命中函数参数名 `options=` —— 第一版就是这么误判的，把 5 个"只下不用"的
+    数据集全报成"有消费方"。只认**路径式**写法：
+        dir_of('x') / frozen_dir('x') / Storage('x')
+        FROZEN_ROOT / "x" / FROZEN / "x"
+        "x/year=" / "/x"（拼路径）
+    """
+    import re
+    root = Path(__file__).resolve().parent.parent
+    skip = {".cache", ".deps", "db", "__pycache__", ".git", ".venv", "venv",
+            "vnpy-4.4.0", "others", "tests", "docs"}
+    esc = re.escape(ds)
+    pats = [re.compile(p) for p in (
+        rf"""(?:dir_of|frozen_dir|recipe_dir)\(\s*['"]{esc}['"]""",
+        rf"""Storage\(\s*['"]{esc}['"]""",
+        rf"""(?:FROZEN_ROOT|FROZEN|DB)\s*/\s*['"]{esc}['"]""",
+        # `DB / "frozen" / "industry"` 这种三段路径（loader.py 就是这么写的）
+        rf"""(?:FROZEN_ROOT|FROZEN|DB)\s*/\s*['"]frozen['"]\s*/\s*['"]{esc}['"]""",
+        rf"""['"]{esc}/year=""",
+        rf"""['"]{esc}/\*""",
+        rf"""/['"]?{esc}['"]?\s*/\s*['"]year=""",
+    )]
+    out = set()
+    for p in root.rglob("*.py"):
+        parts = set(p.parts)
+        if any(x in parts for x in skip) or any(
+                str(x).startswith(("方正证券", "node_modules")) for x in p.parts):
+            continue
+        rel = str(p.relative_to(root))
+        # config.py 只是登记表；downloader/ 与 download_*.py / run_download.py
+        # 是**写入方**，不算消费方 —— 否则"只下不用"永远查不出来
+        if ("config.py" in rel or "downloader" in p.parts
+                or "validate_data" in rel or p.name.startswith("download_")
+                or p.name == "run_download.py"):
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if any(pt.search(txt) for pt in pats):
+            out.add(Path(rel).name)
+    return sorted(out)
+
+
+def check_freshness():
+    """每个 frozen 数据集是否**跟得上最新交易日**，以及**有没有消费方**
+
+    B12：`margin`/`northbound`/`futures`/`options`/`etf` 五个数据集只有下载器、
+    没有任何分析或回测在读它们。风险不是占空间，而是"以为有数据在用"。
+
+    **判据分两级**（见 FRESHNESS_BUDGET 的说明）：
+      落后 > 提示阈值 -> 记为信息（该更新了，但这是运维状态）
+      落后 > 硬失败阈值 -> 记为问题（这个量级只可能是下载坏了）
+    "没有消费方"一律只作信息：保留还是删除是**产品决定**，不该由门禁替人拍板。
+    """
+    from database.calendar import calendar_meta, latest_trading_day
+    print("\n[数据新鲜度] 与最新已发生交易日对比")
+    ref = latest_trading_day()
+    if ref is None:
+        report("交易日历可用", False, "无法确定最新交易日（frozen/calendar 为空）")
+        return
+    m = calendar_meta()
+    log(f"最新已发生交易日: {str(ref)[:10]}"
+        f"（日历另有 {m['n_future']} 个未来占位日，已排除 —— 见 --check calendar）")
+
+    hard, soft, ok_n, unused = [], [], 0, []
+    for ds in sorted(FROZEN_ROOT.iterdir()) if FROZEN_ROOT.exists() else []:
+        if not ds.is_dir():
+            continue
+        name = ds.name
+        label, warn, fail = FRESHNESS_BUDGET.get(name, ("未声明", None, None))
+        if not any(ds.glob("year=*/*.parquet")):
+            continue
+        try:
+            mx, col = _max_date_of(ds, FRESHNESS_DATE_COL.get(name))
+        except Exception as e:
+            log(f"  ⚠ {name}: 取最大日期失败 {type(e).__name__}")
+            continue
+        lag = (ref - mx).days if mx is not None else None
+        rd = _dataset_readers(name)
+        if not rd:
+            unused.append(name)
+        tail = f" 读取方: {', '.join(rd[:3]) if rd else '**无**'}"
+        if warn is None:
+            log(f"  {name:<12} {label:<12} 最大日期 {str(mx)[:10] if mx else '?':<12}{tail}")
+            continue
+        if lag is None:
+            flag = "无日期列"
+        elif fail is not None and lag > fail:
+            flag = f"❌ 落后 {lag} 天(>{fail})"
+            hard.append((name, lag, fail))
+        elif lag > warn:
+            flag = f"⚠ 落后 {lag} 天"
+            soft.append((name, lag))
+        else:
+            flag = "ok"
+            ok_n += 1
+        log(f"  {name:<12} {label:<12} 最大日期 {str(mx)[:10] if mx else '?':<12}"
+            f" 落后 {lag if lag is not None else '?':>4} 天 / 提示 {warn:<4} "
+            f"上限 {fail if fail is not None else '-':<4} {flag:<16}{tail}")
+
+    for name, lag in soft:
+        log(f"  ℹ {name} 落后 {lag} 天 —— 到了该更新的时间（运维状态，不计为问题）")
+    for name, lag, fail in hard:
+        log(f"    ⚠ {name} 落后 {lag} 天，超过硬上限 {fail} —— 这不是'没更新'，"
+            f"更像下载坏了，建议重跑该数据集")
+    report("各数据集新鲜度未超硬上限", not hard,
+           f"{len(hard)} 个数据集结构性过期" if hard
+           else f"{ok_n} 个有预算的数据集未超硬上限（{len(soft)} 个提示）")
+    if unused:
+        # 只提示、不作门禁：保留还是删除这些"下了但没人用"的数据集是产品决定
+        log(f"  ℹ 无任何消费方的 frozen 数据集（B12）: {', '.join(unused)}")
+        log("    要么补上消费方，要么删掉 —— 留着容易让人误以为在用")
+
+
+# ============================================================
+# 8. 断点与磁盘的一致性（B4）
+# ============================================================
+# 断点按"股票"而不是"股票×年份"标记，所以**上游半路返回一截历史**时同样算
+# "成功"，之后永远不会补 —— 这不是理论风险：`frozen/etf`/`frozen/options`
+# 的断点里各有 84 个日期（43 个交易日），磁盘上只有 7 天有数据。
+# 这条检查做两件事：① 断点说完成了、磁盘上却没有 -> 列出来并可修复；
+# ② 逐 code 比对年份覆盖 vs `daily_raw`（参考真值），抓"整段静默截断"。
+CHECKPOINT_CROSS = ("adjust", "valuation")     # 与 daily_raw 做逐 code 年份比对
+# 北交所 920xxx 在 2023 年之前的数据本身就是垃圾（C1），不能拿它当"截断"证据
+_JUNK_PREFIX = "920"
+_JUNK_BEFORE = 2023
+
+
+def _looks_like_date_key(key: str) -> bool:
+    return len(key) == 8 and key.isdigit()
+
+
+def backfill_checkpoint(datasets=None) -> dict:
+    """把磁盘上**已有的数据范围回填进断点**，让旧断点也能被判定
+
+    旧断点只记了"完成了"、没记范围 —— 于是 1,500 多条既不能说它错、也不能说它对
+    （`--check checkpoint` 里那批"无法判定"）。这里直接从 parquet 读出每个 key 的
+    实际日期范围写回去，未知就消失了，之后能抓"数据只到 2015 年"这种尾部截断。
+
+    ⚠️ 回填记录的是**磁盘现状**，不是"它本该有的范围"。所以它不会把已经发生的
+    静默截断洗白 —— 磁盘范围就是短的那一段，覆盖比对照样能看出来。
+    返回 {dataset: 回填条数}
+    """
+    from database.config import connect_duckdb
+    from database.storage import Storage
+    print("\n[断点回填] 用磁盘上的真实数据范围补齐旧断点")
+    targets = datasets or ["daily_raw", "adjust", "valuation", "holders",
+                           "suspend", "st", "financial", "dividend"]
+    con = connect_duckdb()
+    out = {}
+    for ds in targets:
+        d = FROZEN_ROOT / ds
+        if not d.exists() or not (d / "_checkpoint.json").exists():
+            continue
+        st = Storage(ds, allow_frozen=True)
+        done = list(st.load_checkpoint().get("done", []))
+        if not done:
+            continue
+        n = 0
+        # 日期键（etf/options）：范围就是它自己，不用查
+        for k in [x for x in done if _looks_like_date_key(x)]:
+            t = pd.Timestamp(f"{k[:4]}-{k[4:6]}-{k[6:]}")
+            if st.span_of(k) is None and _has_data_for(d, ds, k):
+                st.mark_done(k, span=(t, t))
+                n += 1
+        code_keys = {k for k in done if not _looks_like_date_key(k)}
+        if not code_keys:
+            out[ds] = n
+            log(f"  {ds:<12} 回填 {n:>6} 条范围")
+            continue
+        # code 键：一次 group-by 拿到每只股票的实际范围
+        try:
+            cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet("
+                               f"'{parquet_glob(d)}')").fetchdf()
+            names = set(cols["column_name"])
+            dcol = next((c for c in ("trade_date", "ann_date", "start_date", "end_date")
+                         if c in names), None)
+            if dcol is None:
+                out[ds] = n
+                continue
+            ty = cols[cols["column_name"] == dcol].iloc[0]["column_type"]
+            expr = (f"coalesce(try_strptime({dcol}, '%Y%m%d'), "
+                    f"try_cast({dcol} AS TIMESTAMP))" if "VARCHAR" in ty
+                    else f"try_cast({dcol} AS TIMESTAMP)")
+            df = con.execute(f"""SELECT code, min({expr}) a, max({expr}) b
+                                 FROM read_parquet('{parquet_glob(d)}')
+                                 GROUP BY 1""").fetchdf()
+            for r in df.itertuples(index=False):
+                c = str(r.code).zfill(6)
+                if c in code_keys and pd.notna(r.a) and pd.notna(r.b):
+                    st.mark_done(c, span=(r.a, r.b))
+                    n += 1
+        except Exception as e:
+            log(f"  ⚠ {ds}: 回填失败 {type(e).__name__}: {str(e)[:60]}")
+            continue
+        out[ds] = n
+        log(f"  {ds:<12} 回填 {n:>6} 条范围")
+    con.close()
+    total = sum(out.values())
+    log(f"  合计回填 {total:,} 条；之后 --check checkpoint 就能判定这些条目了")
+    return out
+
+
+def _has_data_for(ds_dir, dataset: str, key: str) -> bool:
+    """这个 key 在磁盘上是否真有数据（**按数据集的文件命名规则判定**）
+
+    ⚠️ 不能一律用 `**/{key}.parquet`：`financial` 的文件名是
+    `{sheet}_{code}.parquet`（profit_000001.parquet），`stocks`/`industry`/
+    `margin` 这类是 `all.parquet`/`data.parquet` 单文件。第一版没区分，
+    于是 `financial` 报出 5,889 条假阳性。
+    """
+    if key == "all":
+        return any(ds_dir.glob("year=*/*.parquet"))
+    if dataset == "financial":
+        return any(ds_dir.glob(f"year=*/*_{key}.parquet"))
+    return any(ds_dir.glob(f"**/{key}.parquet"))
+
+
+def check_checkpoint(repair: bool = False, strict: bool = False):
+    """断点审计：检测"标记完成但数据缺失"，可选自动修复
+
+    B4 说的是"断点按**股票**记，不按**股票×年份**记，所以上游半路返回一截历史
+    时同样算成功、之后永远不补"。**它已经真实发生过**：`frozen/etf` 与
+    `frozen/options` 的断点里各有 84 个日期（43 个交易日），磁盘上只有 7 天有数据。
+
+    分四类处理 —— 关键是**只把能证伪的算作问题**：
+      ① **日期键**（etf/options 按 trade_date 下）没有文件 -> 真问题。
+         一个交易日拿不到数据，永远不是"本来就没有"。
+      ② 北交所 `920xxx` -> C1 的上游垃圾数据，不计。
+      ③ 股票键 + 断点**记过范围**（新格式）却没有文件 -> 真问题（断点在撒谎）。
+      ④ 股票键 + 旧断点（没记范围）-> **无法判定**：既可能是退市股本来就没数据，
+         也可能是被静默截断。列为信息；加 `--strict-checkpoint` 可把这类也当问题。
+    """
+    from database.config import connect_duckdb
+    from database.storage import Storage
+    print("\n[断点一致性] 断点说完成了，磁盘上真的有数据吗")
+
+    con = connect_duckdb()
+    ref_codes = set()
+    try:
+        rr = con.execute(f"""SELECT DISTINCT code FROM read_parquet(
+            '{parquet_glob(FROZEN_ROOT / 'daily_raw')}')""").fetchdf()
+        ref_codes = {str(c).zfill(6) for c in rr["code"]}
+    except Exception as e:
+        log(f"  （daily_raw 扫描失败: {type(e).__name__}，只能按文件存在性判断）")
+    if ref_codes:
+        log(f"  参考：daily_raw 里有数据的股票 {len(ref_codes):,} 只")
+
+    problems, unknown, n_c1 = {}, {}, 0
+    for ds_dir in sorted(FROZEN_ROOT.iterdir()) if FROZEN_ROOT.exists() else []:
+        if not ds_dir.is_dir():
+            continue
+        if not (ds_dir / "_checkpoint.json").exists():
+            continue
+        name = ds_dir.name
+        st = Storage(name, allow_frozen=True)
+        info = st.audit_done(
+            has_data=lambda k, d=ds_dir, n=name: _has_data_for(d, n, k))
+        real, unk = [], []
+        for key in info["no_data"]:
+            if _looks_like_date_key(key):
+                real.append(key)                       # ① 日期键：确证
+            elif key.startswith(_JUNK_PREFIX):
+                n_c1 += 1                              # ② C1 上游垃圾
+            elif st.span_of(key) is None:
+                unk.append(key)                        # ④ 旧断点：无法判定
+            else:
+                real.append(key)                       # ③ 记过范围还缺 -> 确证
+        if real:
+            problems[name] = real
+        if unk:
+            unknown[name] = unk
+        log(f"  {name:<12} 断点 {info['n_done']:>6} 条 / 确证缺失 "
+            f"{len(real):>4} / 无法判定 {len(unk):>5} / "
+            f"已有范围 {len(info['span_end']):>5} / "
+            f"确认空 {len(info['confirmed_empty']):>4}")
+
+    n_missing = sum(len(v) for v in problems.values())
+    for ds, keys in problems.items():
+        log(f"    ⚠ {ds}: {len(keys)} 个 key 标记完成但磁盘无数据（样例 {keys[:5]}）")
+    n_unknown = sum(len(v) for v in unknown.values())
+    if n_unknown:
+        top = sorted(unknown.items(), key=lambda kv: -len(kv[1]))[:4]
+        log(f"  ℹ {n_unknown} 条**无法判定**（旧断点没记数据范围，无法区分"
+            f"「本来就没数据」与「被静默截断」）: "
+            + "、".join(f"{k}={len(v)}" for k, v in top))
+        log("    新下载会记录数据范围，之后就能判定；"
+            "想把这类也当问题请加 --strict-checkpoint")
+    if n_c1:
+        log(f"  ℹ {n_c1} 条属北交所 920xxx（C1 上游垃圾数据），不计")
+    fail = n_missing > 0 or (strict and n_unknown > 0)
+    report("断点标记完成的都有数据", not fail,
+           f"{n_missing} 条断点确证与磁盘不一致（这些永远不会被重试）"
+           + (f"，另有 {n_unknown} 条无法判定" if n_unknown else "")
+           if fail else "确证一致")
+
+    # ② 逐 code 年份覆盖 vs daily_raw（抓整段静默截断）
+    for ds in CHECKPOINT_CROSS:
+        d = FROZEN_ROOT / ds
+        if not d.exists():
+            continue
+        try:
+            ref = con.execute(f"""SELECT code, year(trade_date) y FROM read_parquet(
+                '{parquet_glob(FROZEN_ROOT / 'daily_raw')}') GROUP BY 1, 2""").fetchdf()
+            got = con.execute(f"""SELECT code, year(trade_date) y FROM read_parquet(
+                '{parquet_glob(d)}') GROUP BY 1, 2""").fetchdf()
+        except Exception as e:
+            log(f"  ⚠ {ds}: 扫描失败 {type(e).__name__}")
+            continue
+        ry, gy = {}, {}
+        for r in ref.itertuples(index=False):
+            ry.setdefault(str(r.code).zfill(6), set()).add(int(r.y))
+        for r in got.itertuples(index=False):
+            gy.setdefault(str(r.code).zfill(6), set()).add(int(r.y))
+        bad = []
+        for code, ys in ry.items():
+            if code not in gy:
+                continue                      # 该数据集本就没有这只股票
+            if code.startswith(_JUNK_PREFIX):
+                # 北交所 920xxx 的历史在 daily_raw 里是垃圾（C1），不参与比对
+                ys = {y for y in ys if y >= _JUNK_BEFORE}
+            miss = sorted(ys - gy[code])
+            if len(miss) >= 2:
+                bad.append((code, miss))
+        log(f"  {ds}: 与 daily_raw 逐 code 比对 {len(ry):,} 只，"
+            f"缺 ≥2 个年份的 {len(bad)} 只")
+        for code, miss in bad[:6]:
+            log(f"    ⚠ {code} 缺 {miss}")
+        report(f"{ds} 年份覆盖不落后于 daily_raw", len(bad) == 0,
+               f"{len(bad)} 只缺多年（疑似静默截断）" if bad else "与参考一致")
+
+    # ③ 可选修复：把不一致的 key 从断点里摘掉，让下次下载重试
+    if repair and problems:
+        total = 0
+        for ds, keys in problems.items():
+            st = Storage(ds, allow_frozen=True)
+            total += st.forget_done(keys)
+        log(f"  [修复] 已从 {len(problems)} 个数据集的断点里移除 {total} 个 key，"
+            f"下次运行会重新下载")
+    elif problems:
+        log("  （加 --repair-checkpoint 可把这些 key 摘出断点，让它们重新下载）")
+    con.close()
+
+
+# ============================================================
 def main():
     parser = argparse.ArgumentParser(description="数据库质量校验")
     parser.add_argument("--check", action="append",
                         choices=["unique", "schema", "coverage", "limit",
                                  "completeness", "status", "dates", "listing",
+                                 "calendar", "freshness", "checkpoint",
                                  "all"],
                         help="可重复指定，如 --check limit --check completeness；"
                              "不传等价于 all")
     parser.add_argument("--quick", action="store_true", help="抽样快速检查")
+    parser.add_argument("--strict-checkpoint", action="store_true",
+                        help="把「旧断点未记范围、无法判定」的条目也算作问题")
+    parser.add_argument("--backfill-checkpoint", action="store_true",
+                        help="先用磁盘上的真实数据范围补齐旧断点，再做 --check checkpoint")
+    parser.add_argument("--repair-checkpoint", action="store_true",
+                        help="配合 --check checkpoint：把「标记完成但无数据」的"
+                             "key 从断点里摘掉，让下次下载重试")
     parser.add_argument("--no-strict-exit", action="store_true",
                         help="即使发现问题也返回 0（默认发现问题返回 1，供 CI/调度做门禁）")
     args = parser.parse_args()
@@ -970,7 +1490,8 @@ def main():
     wanted = set(args.check or ["all"])
     if "all" in wanted:
         wanted = {"unique", "schema", "coverage", "limit", "completeness",
-                  "status", "dates", "listing"}
+                  "status", "dates", "listing", "calendar",
+                  "freshness", "checkpoint"}
 
     if "unique" in wanted:
         for ds in ["daily", "frozen/valuation", "frozen/adjust"]:
@@ -985,6 +1506,15 @@ def main():
         check_limit_rules()
     if "listing" in wanted:
         check_listing_rules()
+    if "calendar" in wanted:
+        check_calendar()
+    if "freshness" in wanted:
+        check_freshness()
+    if "checkpoint" in wanted:
+        if args.backfill_checkpoint:
+            backfill_checkpoint()
+        check_checkpoint(repair=args.repair_checkpoint,
+                         strict=args.strict_checkpoint)
     if "completeness" in wanted:
         check_year_completeness()
     if "status" in wanted:

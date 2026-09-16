@@ -21,7 +21,7 @@ class StStatusDownloader(BaseDownloader):
         self._tc = get_client()
         df = self._tc.call("namechange", ts_code=self._ts_code(code))
         if df is None or df.empty:
-            self.storage.mark_done(code)
+            self.storage.mark_done(code, empty=True)
             return pd.DataFrame()
         df["code"] = code
         # 标记是否 ST
@@ -65,7 +65,7 @@ class SuspendDownloader(BaseDownloader):
         df = self._tc.call("suspend_d", ts_code=self._ts_code(code),
                            start_date=f"{self.start_year}0101", end_date="20500101")
         if df is None or df.empty:
-            self.storage.mark_done(code)
+            self.storage.mark_done(code, empty=True)
             return pd.DataFrame()
         df["code"] = code
         for c in ["suspend_date", "resume_date"]:
@@ -117,7 +117,7 @@ class MetaDownloader(BaseDownloader):
         from database.limit_rules import (apply_limit_prices, listing_windows,
                                           load_st_intervals)
         if daily.empty:
-            self.storage.mark_done(code)
+            self.storage.mark_done(code, empty=True)
             return pd.DataFrame()
         df = daily.sort_values("trade_date").copy()
         if "pre_close" not in df.columns:
@@ -140,7 +140,7 @@ class MetaDownloader(BaseDownloader):
             if y < self.start_year:
                 continue
             self.save_year(g.drop(columns="year"), year=int(y), code=code, force=True)
-        self.storage.mark_done(code)
+        self.storage.mark_done(code, span=self._span_of(out))
         return out
 
     def download(self, codes: list = None, resume: bool = True):

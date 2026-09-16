@@ -444,38 +444,19 @@ class JQData:
     # 交易日
     # ===========================================================
     def _load_calendar(self):
-        """交易所交易日历（frozen/calendar）
+        """交易所交易日历（**已裁剪到今天**，唯一实现在 database/calendar.py）
 
-        ⚠️ **已不再被 `trade_days()` 使用（2026-09 审计确认无调用方）**。
-        保留只为兼容历史代码。要理解为什么不能用它，见 `trade_days()` 的说明：
-        `frozen/calendar` 覆盖到 **2027**（含未来占位日），比面板长 486 天，
-        策略据此算出的调仓日引擎跑不到，会卡死状态机。
+        ⚠️ **已不再被 `trade_days()` 使用（2026-09 审计确认无调用方）**，
+        保留只为兼容历史代码。为什么 `trade_days()` 宁可用面板日期也不用它，
+        见那个方法的说明：日历比面板长、策略据此算出的调仓日引擎跑不到，
+        会把状态机卡死。
 
-        另外它把 38 个分区 `pd.concat` 起来逐文件读 —— 比 DuckDB 慢一个量级。
+        注意这里返回的是**裁剪版**（不含未来占位日）—— 原来直接把
+        `frozen/calendar` 的全部日期返回，是个陷阱。
         """
-        from database.config import FROZEN_ROOT
-        fs = sorted((FROZEN_ROOT / "calendar").rglob("*.parquet"))
-        if not fs:
-            return None
-        try:
-            df = pd.concat([pd.read_parquet(f) for f in fs], ignore_index=True)
-        except Exception:
-            return None
-        for col in ("cal_date", "trade_date", "date"):
-            if col in df.columns:
-                s = df[col]
-                # trade_date 有的年份是 datetime、有的是 YYYYMMDD 字符串，两种都要认
-                if pd.api.types.is_datetime64_any_dtype(s):
-                    s = pd.to_datetime(s, errors="coerce")
-                else:
-                    # 走统一容错解析：VARCHAR 列里可能混着 'YYYY-MM-DD HH:MM:SS'
-                    from database.dates import parse_tushare_date
-                    s = parse_tushare_date(s)
-                if "is_open" in df.columns:
-                    s = s[pd.to_numeric(df["is_open"], errors="coerce") == 1]
-                s = s.dropna().drop_duplicates().sort_values()
-                return pd.DatetimeIndex(s)
-        return None
+        from database.calendar import trading_days
+        cal = trading_days()
+        return cal if len(cal) else None
 
     def trade_days(self, start=None, end=None, count=None) -> pd.DatetimeIndex:
         """交易日列表

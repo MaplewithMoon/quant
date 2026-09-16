@@ -146,16 +146,102 @@ class Storage:
             json.dumps(state, ensure_ascii=False, indent=2),
         )
 
-    def mark_done(self, key: str):
+    def mark_done(self, key: str, span=None, empty: bool = False):
+        """标记某个 key（通常是股票代码）已完成
+
+        ⚠️ **只有真的写入了数据才该调用**（或确认"这只股票本来就没有数据"）。
+        把"我以为成功了"标成完成会把缺失**永久固化** —— 断点续跑从此跳过它。
+        这不是理论风险：`frozen/etf` 与 `frozen/options` 的断点里各有 84 个日期
+        （其中 43 个是交易日），磁盘上**只有 7 天有数据**，其余 36 个交易日被标成
+        done 却永远补不回来（问题清单 B4）。
+
+        参数:
+            span:  `(first_date, last_date)` —— 本次**实际写到磁盘**的数据范围。
+                   记下来之后才能审计"断点说完成了，但数据只到 2015 年"
+                   这种静默截断（tushare 返回半截历史时就是这么坏的）。
+            empty: True 表示**已确认该 key 没有数据**（如退市股在区间内无行情）。
+                   与"有数据但没记范围"区分开，避免 audit 把两者混为一谈。
+        """
         cp = self.load_checkpoint()
         done = cp.setdefault("done", [])
-        if key in done:
-            return
-        done.append(key)
+        if key not in done:
+            done.append(key)
+        spans = cp.setdefault("spans", {})
+        if span is not None:
+            try:
+                a, b = span
+                spans[key] = [str(pd.Timestamp(a))[:10], str(pd.Timestamp(b))[:10]]
+            except (TypeError, ValueError):
+                pass
+        elif empty:
+            spans[key] = []           # 显式空：确认无数据
         self.save_checkpoint(cp)
 
     def is_done(self, key: str) -> bool:
         return key in self.load_checkpoint().get("done", [])
+
+    @property
+    def _spans(self) -> dict:
+        return self.load_checkpoint().get("spans", {})
+
+    def span_of(self, key: str):
+        """断点记录的该 key 数据范围 -> (first, last) / () 表示确认无数据 / None 未知"""
+        s = self._spans.get(key)
+        if s is None:
+            return None
+        if len(s) == 0:
+            return ()
+        try:
+            return pd.Timestamp(s[0]), pd.Timestamp(s[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def forget_done(self, keys) -> int:
+        """把若干 key 从断点里移除（连同 span），让下次运行重新下载
+
+        用于修复"标记完成但数据缺失"—— 这是 B4 的**补救路径**：
+        光能检测不够，还得能把它变回"待下载"。返回实际移除的个数。
+        """
+        cp = self.load_checkpoint()
+        done = list(cp.get("done", []))
+        spans = cp.get("spans", {})
+        keys = set(keys)
+        cp["done"] = [k for k in done if k not in keys]
+        for k in keys:
+            spans.pop(k, None)
+        self.save_checkpoint(cp)
+        return len(done) - len(cp["done"])
+
+    def audit_done(self, has_data=None) -> dict:
+        """审计断点与磁盘是否一致（B4 的检测路径）
+
+        参数:
+            has_data: 可选 `f(key) -> bool`，判断磁盘上是否真有数据。
+                      不传则用 `**/{key}.parquet` 是否存在判定。
+
+        返回:
+            n_done        断点里 key 的总数
+            no_data       标记完成、磁盘上却没有数据 -> **应重新下载**
+            confirmed_empty 明确记为"确认无数据"的（正常，不算问题）
+            span_unknown  有数据但没记范围（旧断点）-> 无法核对是否被静默截断
+            span_end      有范围记录的：{key: last_date}，供调用方与参考数据比对
+        """
+        done = list(self.load_checkpoint().get("done", []))
+        no_data, confirmed_empty, span_unknown, span_end = [], [], [], {}
+        for key in done:
+            ok = (has_data(key) if has_data is not None
+                  else any(self.root.glob(f"**/{key}.parquet")))
+            sp = self.span_of(key)
+            if not ok:
+                (confirmed_empty if sp == () else no_data).append(key)
+                continue
+            if sp is None:
+                span_unknown.append(key)
+            elif sp:
+                span_end[key] = sp[1]
+        return {"n_done": len(done), "no_data": no_data,
+                "confirmed_empty": confirmed_empty,
+                "span_unknown": span_unknown, "span_end": span_end}
 
     # ---------- Parquet 读写 ----------
     def save(self, df: pd.DataFrame, year: int = None, code: str = None,

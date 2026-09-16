@@ -22,7 +22,8 @@ class AdjustDownloader(BaseDownloader):
             start=f"{self.start_year}0101", end="20500101",
         )
         if df is None or df.empty:
-            self.storage.mark_done(code)
+            # 确认无数据。必须与"有数据但没记范围"区分：audit_done 靠 empty 判定
+            self.storage.mark_done(code, empty=True)
             return pd.DataFrame()
         df["code"] = code
         df["trade_date"] = pd.to_datetime(df["trade_date"])
@@ -32,7 +33,7 @@ class AdjustDownloader(BaseDownloader):
             if y < self.start_year:
                 continue
             self.save_year(g.drop(columns="year"), year=int(y), code=code, force=True)
-        self.storage.mark_done(code)
+        self.storage.mark_done(code, span=self._span_of(df))
         return df
 
     def download(self, codes: list = None, resume: bool = True):
@@ -70,11 +71,11 @@ class DividendDownloader(BaseDownloader):
         self._tc = get_client()
         df = self._tc.call("dividend", ts_code=self._ts_code(code))
         if df is None or df.empty:
-            self.storage.mark_done(code)
+            self.storage.mark_done(code, empty=True)
             return pd.DataFrame()
         df["code"] = code
         self.save_year(df, year=2005, code=code, force=True)
-        self.storage.mark_done(code)
+        self.storage.mark_done(code, span=self._span_of(df))
         return df
 
     def download(self, codes: list = None, resume: bool = True):

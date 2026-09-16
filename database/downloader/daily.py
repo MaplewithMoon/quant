@@ -107,7 +107,7 @@ class DailyDownloader(BaseDownloader):
         df = self._cross_validate(df_ak, df_bs, code)
         if df.empty:
             self.logger.warning(f"{code} 无数据，标记跳过")
-            self.storage.mark_done(code)
+            self.storage.mark_done(code, empty=True)
             return df
 
         # 按年分区存储
@@ -117,7 +117,7 @@ class DailyDownloader(BaseDownloader):
                 continue
             self.save_year(g.drop(columns="year"), year=int(y), code=code)
 
-        self.storage.mark_done(code)
+        self.storage.mark_done(code, span=self._span_of(df))
         return df
 
     def download(self, codes: list = None, resume: bool = True):
