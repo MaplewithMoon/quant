@@ -164,8 +164,16 @@ def download_valuation(pro, codes):
 
 
 # ============ etf / options：按**真实交易日**下全市场快照 ============
+# tushare 单次返回有**行数上限**（实测 opt_daily 恒定 15000 行就不再增长），
+# 按 trade_date 一把取会**静默截断**：实测某交易日一把取 15,000 行，
+# 按交易所拆开合计 **26,566 行** —— 每天丢掉约 44%。所以必须拆。
+OPT_EXCHANGES = ("SSE", "SZSE", "CFFEX", "DCE", "CZCE", "SHFE", "INE", "GFEX")
+SINGLE_CALL_LIMIT = 15000        # 触到这个数就怀疑被截断
+
+
 def _download_by_trading_days(pro, dataset: str, api: str, desc: str,
-                              calls_per_min: int, start_year: int = 2020):
+                              calls_per_min: int, start_year: int = 2020,
+                              exchanges=None):
     """按交易日逐日下载全市场快照，**每天一个文件**
 
     ⚠️ 旧实现有三个错，直接导致 `frozen/etf` 与 `frozen/options` 废掉：
@@ -175,36 +183,61 @@ def _download_by_trading_days(pro, dataset: str, api: str, desc: str,
          -> 后一天覆盖前一天，实测 2020~2026 每年只剩 1 天数据。
     现在：从 `database.calendar.trading_days()` 取真实交易日；**只有真的写出
     数据才标完成并记范围**；每天写 `year={Y}/{日期}.parquet`，互不覆盖。
+
+    exchanges: 需要按交易所拆分时传入（`opt_daily` **必须**拆，见上）；
+               `fund_daily` 不支持 exchange 过滤（传了返回同一批），传 None。
     """
-    limiter = RateLimiter()
+    # ⚠️ 必须把 calls_per_min 传进 RateLimiter：不传就是默认 190/分钟，
+    #    远超这些接口的限频，会被拒（拒了不会标完成、下次还能补，但很吵）
+    limiter = RateLimiter(calls_per_min)
     store = _store(dataset)
     done = done_set(dataset)
     from database.calendar import trading_days
     days = [d for d in trading_days(start=f"{start_year}-01-01")]
     todo = [d for d in days if d.strftime("%Y%m%d") not in done]
-    print(f"[{dataset}] 交易日 {len(days)} 个，待下 {len(todo)} 个", flush=True)
-    n_empty = 0
+    n_call = len(todo) * len(exchanges or (None,))
+    print(f"[{dataset}] 交易日 {len(days)} 个，待下 {len(todo)} 个"
+          f"（{n_call:,} 次调用 @ {calls_per_min}/分钟 ≈ {n_call / calls_per_min:.0f} 分钟）",
+          flush=True)
+    n_empty, n_capped = 0, 0
     with tqdm(total=len(todo), desc=desc, ncols=100) as pbar:
         for d in todo:
             key = d.strftime("%Y%m%d")
             check_disk()
+            frames = []
             try:
-                df = api_call(pro, api, limiter, trade_date=key)
-                if df is None or df.empty:
-                    # **不标完成**：交易日却拿不到数据，下次还要重试
-                    n_empty += 1
-                else:
-                    df = df.copy()
-                    df["trade_date"] = pd.to_datetime(d.strftime("%Y-%m-%d"))
-                    save_by_year(df, dataset, code=d.strftime("%Y-%m-%d"))
-                    store.mark_done(key, span=(d, d))
+                for ex in (exchanges or (None,)):
+                    params = {"trade_date": key}
+                    if ex:
+                        params["exchange"] = ex
+                    df = api_call(pro, api, limiter, **params)
+                    if df is None or df.empty:
+                        continue
+                    if len(df) >= SINGLE_CALL_LIMIT:
+                        # 触顶说明这次很可能被截断了 —— 必须让人看见，
+                        # 否则就是"安静地少数据"
+                        n_capped += 1
+                        print(f"  ⚠ {key}/{ex or '全部'} 返回 {len(df)} 行，"
+                              f"疑似触到单次上限，数据可能被截断", flush=True)
+                    frames.append(df)
             except Exception as e:
-                print(f"  {key} 失败: {str(e)[:50]}", flush=True)
+                print(f"  {key} 失败: {str(e)[:60]}", flush=True)
+            if frames:
+                out = pd.concat(frames, ignore_index=True)
+                out["trade_date"] = pd.to_datetime(d.strftime("%Y-%m-%d"))
+                save_by_year(out, dataset, code=d.strftime("%Y-%m-%d"))
+                store.mark_done(key, span=(d, d))
+            else:
+                # **不标完成**：交易日却拿不到数据，下次还要重试
+                n_empty += 1
             pbar.set_postfix(day=key)
             pbar.update(1)
     if n_empty:
         print(f"[{dataset}] 有 {n_empty} 个交易日返回空 —— 未标记完成，"
               f"下次运行会重试（空响应 != 确认无数据）", flush=True)
+    if n_capped:
+        print(f"[{dataset}] 有 {n_capped} 次调用触到单次上限 {SINGLE_CALL_LIMIT}，"
+              f"数据可能不完整 —— 请检查是否需要再细分（换/加过滤维度）", flush=True)
     print(f"[{dataset}] 完成 {len(done_set(dataset))} 个交易日", flush=True)
 
 
@@ -216,8 +249,10 @@ def download_etf(pro):
         print(f"[etf] 基金列表: {len(basic)} 只", flush=True)
     except Exception as e:
         print(f"[etf] 基金列表失败: {str(e)[:60]}", flush=True)
+    # fund_daily **不支持** exchange 过滤（实测传 SSE/SZSE 返回同一批 2,139 行），
+    # 好在它没触到单次上限（每日 2,100~2,200 行，逐日浮动 → 是真实行数）
     _download_by_trading_days(pro, "etf", "fund_daily", "etf日线",
-                              calls_per_min=20)
+                              calls_per_min=60)
 
 
 def download_options(pro):
@@ -228,8 +263,9 @@ def download_options(pro):
         print(f"[options] 合约列表: {len(basic)} 个", flush=True)
     except Exception as e:
         print(f"[options] 合约列表失败: {str(e)[:60]}", flush=True)
+    # **必须按交易所拆**：一把取恒定 15,000 行（单次上限），实测拆开合计 26,566 行
     _download_by_trading_days(pro, "options", "opt_daily", "options日线",
-                              calls_per_min=15)
+                              calls_per_min=100, exchanges=OPT_EXCHANGES)
 
 
 def main():
@@ -254,16 +290,21 @@ def main():
         codes = sorted(st["code"].astype(str).tolist())
         print(f"有效股票(剔除退市): {len(codes)} 只", flush=True)
 
+    order = (["adjust", "st", "valuation", "etf", "options"]
+             if args.only == "all" else [args.only])
+
     if args.fresh:
-        for ds in ["adjust", "st", "valuation", "etf", "options"]:
-            # 断点文件就在数据集目录里，删目录时一并清掉；不依赖已删除的 ckpt_path()
+        # ⚠️ 必须**只清 --only 指定的那个**：早期写法无条件清空五个数据集，
+        # 于是 `--fresh --only etf` 会把 adjust/st/valuation 一起删掉
+        # （那是 7 万只股票的数据，重下要几十小时）。
+        for ds in order:
             d = FROZEN / ds
             if d.exists():
                 import shutil as _sh
                 _sh.rmtree(d)
-        print("已清空断点和数据，从头重新下载", flush=True)
+            print(f"已清空 {ds} 的断点和数据", flush=True)
+        print("从头重新下载", flush=True)
 
-    order = ["adjust", "st", "valuation", "etf", "options"] if args.only == "all" else [args.only]
     for ds in order:
         print(f"\n{'='*60}\n下载: {ds}\n{'='*60}", flush=True)
         if ds == "adjust":
