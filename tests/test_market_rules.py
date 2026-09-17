@@ -273,11 +273,21 @@ def test_limit_price_space_alignment():
     code, s, e = "002644", "2024-03-01", "2024-12-31"
     raw = load_trading_status(code, s, e, adjust="")
     qfq = load_trading_status(code, s, e, adjust="qfq")
-    if raw.empty or qfq.empty:
-        print("[SKIP] 该股无涨跌停数据")
+    # ⚠️ 守卫不能只判 `.empty`：无数据时 loader 可能返回**没有 trade_date 列**
+    # 的对象，`.empty` 未必为 True，随后 merge 直接 KeyError。
+    # 这是"读真实数据的测试"，数据不在时必须**干净跳过**（CI 里没有 db/）。
+    if (raw is None or qfq is None or raw.empty or qfq.empty
+            or "trade_date" not in raw.columns
+            or "trade_date" not in qfq.columns):
+        print("[SKIP] 无涨跌停数据（或列不齐），跳过复权空间一致性检查")
         return
 
     fac = load_factor(code)
+    # 复权因子也要有守卫：无数据时它同样可能缺 trade_date 列
+    if (fac is None or fac.empty or "trade_date" not in getattr(fac, "columns", [])
+            or "factor" not in getattr(fac, "columns", [])):
+        print("[SKIP] 无复权因子数据，跳过复权空间一致性检查")
+        return
     m = raw.merge(qfq, on="trade_date", suffixes=("_raw", "_qfq")).sort_values("trade_date")
     m = pd.merge_asof(m, fac.sort_values("trade_date"), on="trade_date",
                       direction="backward")

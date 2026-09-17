@@ -75,6 +75,17 @@ jobs:
       - name: 单元测试（项目自带 run_tests.py）
         run: python scripts/run_tests.py
 
+      # 离线校验：把数据目录指到不存在的位置，再跑一遍"本该不依赖数据"的测试。
+      #
+      # 为什么必须单独做这一步（同一类失败已经出现过两次）：
+      #   1. test_market.py 读真实 ETF 数据 -> 本地过、CI 不过
+      #   2. test_resumption_and_suspension.py 是**纯合成**用例，却隐式依赖
+      #      frozen/calendar -> CI 里日历为空，断言全废，
+      #      而**本地有 db 所以一直是绿的**、肉眼审不出来
+      # 所以把"测试必须能在无 db/ 环境下通过"变成显式门禁。
+      - name: 离线校验（无 db/ 环境下测试必须仍能通过）
+        run: python scripts/check_offline.py
+
   # ---------------------------------------------------------------------------
   #  静态检查：**门禁**（2026-09 起不再是 continue-on-error）
   #

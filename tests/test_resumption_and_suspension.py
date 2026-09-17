@@ -44,22 +44,36 @@ def _series(dates, code="000001", pre_close=9.9):
 # ============================================================
 # 一、复牌首日检测（纯合成）
 # ============================================================
+def _cal(start="2024-01-01", end="2024-04-01"):
+    """**合成交易日历**（注入用）
+
+    ⚠️ 必须注入：`resumption_windows` 靠"错过几个交易日"判定停牌，而交易日历
+    来自 `frozen/calendar`。**CI 里没有 `db/`，日历为空 -> 恒返回全 False**，
+    这些合成断言就全部失效 —— 本地有 db 所以过得去，CI 一跑就红。
+
+    这类"测试隐式依赖 db"和直接读数据的测试不同：它看上去是纯合成用例，
+    完全不该依赖本机数据，所以更容易漏。
+    """
+    return pd.bdate_range(start, end)
+
+
 def test_resumption_detected_after_long_halt():
     """停牌超过阈值 -> 复牌首日被标记，涨跌停置 NaN"""
     from database.limit_rules import (RESUME_NO_LIMIT_MIN_MISSED,
                                       apply_limit_prices, resumption_windows)
 
-    # 前 3 天连续，然后空 30 个交易日，再 3 天
+    # 前 3 天连续，然后空约 40 个交易日，再 3 天
     before = pd.bdate_range("2024-01-02", periods=3)
     after = pd.bdate_range("2024-03-01", periods=3)
     dates = list(before) + list(after)
     df = _series(dates)
-    w = resumption_windows(df)
+    cal = _cal()
+    w = resumption_windows(df, cal=cal)
     assert not w[:3].any(), "连续交易日不该被标成复牌首日"
     assert w[3], "长期停牌后的第一根 K 线应标成复牌首日"
     assert not w[4:].any(), "复牌后第二天不该再标"
 
-    out = apply_limit_prices(df, "000001", resume_no_limit=True)
+    out = apply_limit_prices(df, "000001", resume_no_limit=True, cal=cal)
     assert pd.isna(out.loc[3, "limit_up"]), "复牌首日应不设涨跌停"
     assert pd.isna(out.loc[3, "limit_down"])
     assert not pd.isna(out.loc[4, "limit_up"]), "复牌次日应恢复正常涨跌停"
@@ -68,7 +82,7 @@ def test_resumption_detected_after_long_halt():
           f"涨跌停置 NaN，次日恢复")
     # **默认必须关闭**：传入日期子集（如只取月度调仓日）会把每个采样点
     # 都误判成复牌首日。这个坑在实现时真的踩到了。
-    d2 = apply_limit_prices(df, "000001")
+    d2 = apply_limit_prices(df, "000001", cal=cal)
     assert d2["limit_up"].notna().all(), \
         "默认不该启用复牌规则 —— 日期子集会被整片误判成复牌首日"
     print("[OK] 复牌规则默认关闭（防止日期子集被误判）")
@@ -87,9 +101,10 @@ def test_short_halt_keeps_limit():
     d.append(pd.Timestamp("2024-01-08"))       # 跳过几天（短停牌）
     d += list(pd.bdate_range("2024-01-09", periods=2))
     df = _series(d)
-    w = resumption_windows(df)
+    cal = _cal()
+    w = resumption_windows(df, cal=cal)
     assert not w.any(), f"短停牌不该被标成复牌首日: {w}"
-    out = apply_limit_prices(df, "000001", resume_no_limit=True)
+    out = apply_limit_prices(df, "000001", resume_no_limit=True, cal=cal)
     assert out["limit_up"].notna().all(), "短停牌后仍应有涨跌停限制"
     print("[OK] 短停牌不豁免涨跌停（避免把 6.8 万行正常约束误放行）")
 

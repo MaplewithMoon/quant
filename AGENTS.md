@@ -101,6 +101,21 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
   （以前是硬编码清单，漏过文件，已改）。
 - 测试**不能依赖 `db/` 或网络**（CI 里没有 `db/`）。读真实数据的测试要
   用存在性守卫，数据不在时干净跳过。
+- **守卫不能只判 `.empty`**：loader 在无数据时可能返回**缺列**的对象，
+  `.empty` 未必为 True，随后 `merge(..., on="trade_date")` 直接 KeyError。
+  实测 `test_market_rules.py` 就是这么在 CI 里炸的 —— 要么判列存不存在，
+  要么把依赖做成参数注入。
+- **纯合成的测试也可能隐式依赖 `db/`，这类最难发现**：`test_resumption_*`
+  看上去完全不该依赖数据，却因为 `resumption_windows` 去读 `frozen/calendar`
+  而在 CI 里断言全废（日历为空 -> 恒返回 False），**本地有 db 所以一直绿**。
+  所以合成用例里凡是要用日历/主表的，都走**参数注入**：
+  `resumption_windows(..., cal=...)`、`apply_limit_prices(..., cal=...)`、
+  `build_universe(..., master=...)`。
+- **提交前跑 `python scripts/check_offline.py`**：它把数据目录指到不存在的位置、
+  逐文件独立子进程跑一遍，专门抓上面两类。CI 里也有这一步。
+  ⚠️ 必须独立子进程 —— 同一进程里"先 import 再改路径"是**无效**的，
+  `database.loader` 之类在 import 时就把根路径抓成常量了（第一版 harness
+  因此在 `test_market_rules.py` 上误报过）。
 - 也别用 pytest 的 `tmp_path`：它在受限环境会 PermissionError；
   用 `tests/test_data_provenance.py::_tmpdir()` 那套项目内临时目录。
 - **不要 push**。提交到本地即可，推送由人来做。

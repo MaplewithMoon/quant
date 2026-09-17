@@ -436,7 +436,8 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
                        pre_close_col: str = "pre_close",
                        tick: float = TICK,
                        listing_rule: Tuple = None,
-                       resume_no_limit: bool = False) -> pd.DataFrame:
+                       resume_no_limit: bool = False,
+                       cal: pd.DatetimeIndex = None) -> pd.DataFrame:
     """给带官方 `pre_close` 的日线表加上 `limit_up` / `limit_down`
 
     ⚠️ 必须传**官方 pre_close**（tushare 已按除权调整），
@@ -454,6 +455,9 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
                   `test_limit_rules` 用 3 个相隔数月的日期，结果全被判成复牌。
                   全量重建涨跌停价的路径（`rebuild_limit.py`、
                   `daily_update.rebuild_limit_year`）拿的是完整日线，已显式打开。
+    cal:          交易日历（可注入）。默认读 `frozen/calendar`。
+                  ⚠️ 注入是为了**可测**：CI 里没有 `db/`，日历为空会让
+                  `resumption_windows` 恒返回全 False，合成测试就测不出东西。
     """
     out = df.copy()
     if pre_close_col not in out.columns:
@@ -519,7 +523,7 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
 
     # 复牌首日不设涨跌幅（C4b 的真实机制，见上方 RESUME_NO_LIMIT_MIN_MISSED）
     if resume_no_limit:
-        rw = resumption_windows(out, code, date_col="trade_date")
+        rw = resumption_windows(out, code, date_col="trade_date", cal=cal)
         if rw.any():
             out.loc[rw, ["limit_up", "limit_down"]] = np.nan
         out["is_resumption"] = rw
