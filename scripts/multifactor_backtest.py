@@ -134,26 +134,10 @@ def main():
                     help="预热自然日；⚠️ 改这个值会导致面板缓存未命中（重扫约 8 分钟）")
     ap.add_argument("--benchmark", default=BENCH_CODE)
     ap.add_argument("--capital", type=float, default=1_000_000)
-    ap.add_argument("--commission", type=float, default=0.0001)
-    ap.add_argument("--stamp-duty", type=float, default=0.0005)
-    ap.add_argument("--min-commission", type=float, default=5.0)
-    ap.add_argument("--slippage", type=float, default=0.001,
-                    help="固定滑点（--impact-model fixed 时用）。"
-                         "⚠️ 默认值原先是 0.0，见下方 C6 说明")
-    ap.add_argument("--impact-model", default="fixed", choices=["none", "fixed", "sqrt"],
-                    help="市场冲击模型。用 sqrt 时必须配合 --capital 做容量分析："
-                         "冲击 ∝ 下单量/成交量，资金越大衰减越快")
-    ap.add_argument("--impact-k", type=float, default=0.1,
-                    help="平方根冲击系数（--impact-model sqrt 时用）")
-    # 组合层风控（默认全关 = 保持原行为；要开就显式给阈值）
-    ap.add_argument("--max-weight", type=float, default=0.0,
-                    help="单票权重上限，如 0.05（0=不启用）")
-    ap.add_argument("--max-drawdown", type=float, default=0.0,
-                    help="回撤降仓阈值，如 0.20 表示回撤 20%% 时压到最低仓位（0=不启用）")
-    ap.add_argument("--derisk-min-exposure", type=float, default=0.0,
-                    help="回撤降仓的最低总仓位（配合 --max-drawdown）")
-    ap.add_argument("--max-turnover", type=float, default=0.0,
-                    help="单次调仓换手上限，如 0.5（0=不启用）")
+    # 执行参数（成交时点 / 滑点 / 冲击模型 / 全部费用）由公共层统一提供 ——
+    # 原先散落在各脚本里各写一遍，抄漏一处就永久缺失（见 execution/setup.py）
+    from execution.setup import add_execution_args
+    add_execution_args(ap)
     ap.add_argument("--min-listed-days", type=int, default=120)
     ap.add_argument("--min-amount", type=float, default=5e7)
     ap.add_argument("--rebalance", default="M")
@@ -173,20 +157,14 @@ def main():
     warmup = (start - pd.Timedelta(days=int(args.warmup_days))).strftime("%Y-%m-%d")
     setup_font()
 
-    engine_kwargs = dict(initial_capital=args.capital, commission=args.commission,
-                         min_commission=args.min_commission,
-                         stamp_duty=args.stamp_duty, slippage=args.slippage)
+    from execution.setup import build_execution
+    engine_kwargs = dict(initial_capital=args.capital, **build_execution(args))
 
     # ⚠️ C6：这个脚本原先**完全没有接冲击成本模型**，而且 `--slippage` 默认 0.0。
     # 后果是：把 --capital 从 100 万调到 1 亿，回测结果**一分钱都不会变** ——
     # 也就是说 A4「turnover_20 的容量」根本无法用这个脚本验证。
     # 现在按其他回测脚本的口径统一：fixed 滑点（默认 1bp），要评估容量就
     # 换成 --impact-model sqrt（冲击 ∝ 下单量/成交量，会随资金规模放大）。
-    from execution.impact import build_model
-    if args.impact_model != "none":
-        engine_kwargs["slippage_model"] = build_model(
-            args.impact_model, rate=args.slippage, k=args.impact_k)
-
     # 组合层风控配置（None = 不启用，行为与改动前一致）
     risk_config = {
         "max_weight": args.max_weight,
@@ -404,7 +382,23 @@ def main():
                 _extra = []
                 _st = style_report(R, close, style_panels, _factor_rets)
                 if _st:
-                    _extra = _st
+                    _extra += _st
+                # 成交时点对照：**默认跑**（不是"可以传开关跑两版"）。
+                # 不跑就永远不知道结论对成交时点有多敏感，F1 的归因也无从谈起。
+                if not args.no_fill_compare:
+                    from backtest.fill_compare import compare_fill_timing
+                    from risk import build_risk_manager
+                    _evp = {k: v.loc[(v.index >= pd.Timestamp(warmup))
+                                     & (v.index <= pd.Timestamp(args.end))]
+                            for k, v in panel.items() if isinstance(v, pd.DataFrame)}
+                    _cmp = compare_fill_timing(
+                        lambda **kw: PortfolioBacktestEngine(**kw),
+                        _evp, R["full"]["target"],
+                        base_kwargs=dict(engine_kwargs),
+                        run_kwargs={"risk_manager": build_risk_manager(risk_config),
+                                    "context": bt_ctx})
+                    if _cmp["text"]:
+                        _extra += _cmp["text"].split("\n")
                 print(r["result"].render(
                     title=f"{label}（{R['names']}，持股 {R['n_hold']}）"
                           f"  {args.start} ~ {args.end}",

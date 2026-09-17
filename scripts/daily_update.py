@@ -233,9 +233,21 @@ def clean_file(df):
         bad |= v.isna() | (v <= 0)
     o, h, lo, cl = (pd.to_numeric(df[c], errors="coerce") for c in ["open", "high", "low", "close"])
     vok = o.notna() & h.notna() & lo.notna() & cl.notna()
-    bad |= vok & ~(h >= lo) | vok & ~(lo <= o) | vok & ~(o <= h) | vok & ~(lo <= cl) | vok & ~(cl <= h)
+    # ⚠️ 逐项写，不要拼成一条 `a | b | c ...`：`&` 的结合力**强于** `|`，
+    # 原来的单行写法实际被解析成
+    #     (vok & ~(h>=lo)) | (vok & ~(lo<=o)) | ~(o<=h) | ~(lo<=cl) | ~(cl<=h)
+    # —— 后三项的前置守卫 `vok` **失效了**。当前因为 NaN 行已被上面的
+    # `v.isna()` 标记、`~(NaN<=NaN)` 恰好也是 True，结果没变；但这是随时会在
+    # 改动后变成真 bug 的写法。
+    bad |= vok & ~(h >= lo)
+    bad |= vok & ~(lo <= o)
+    bad |= vok & ~(o <= h)
+    bad |= vok & ~(lo <= cl)
+    bad |= vok & ~(cl <= h)
     amt = pd.to_numeric(df["amount"], errors="coerce")
-    vwap = amt / vol.replace(0, pd.NA)
+    # 成交量 0 时用 NaN 兜住，避免 0 除产生 inf
+    # （用 float("nan") 而不是 pd.NA：本文件没导入 numpy，且 vol 是 float 列）
+    vwap = amt / vol.replace(0, float("nan"))
     bad |= vwap.notna() & vok & ~((vwap >= lo * 0.95) & (vwap <= h * 1.05))
     return df[~bad]
 
