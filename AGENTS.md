@@ -43,6 +43,14 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 - PowerShell 的 `*>` 写出来是 **UTF-16LE**，会把中文弄乱；要用
   `python -u ... *> file` 再以 `encoding='utf-16'` 读。
 - 单条命令超过约 600 秒会被执行器杀掉，长任务用后台作业。
+- **需要装 site-package 但没权限时，直接抛出来让人装。** 沙箱会把
+  `pip install` 挡在写临时目录这一步（`Permission denied: .../pip-unpack-*`），
+  这是策略拒绝、不是 bug，**不要反复重试也别绕**。正确做法：把**完整安装命令**
+  写清楚交给用户，他在有权限的 PowerShell 里装。例如：
+  ```
+  python -m pip install jqdatasdk -i https://pypi.tuna.tsinghua.edu.cn/simple
+  ```
+  装完后再继续。写文件到 `db/` 被拒时同理（那次是升级权限解决的，见下）。
 
 ---
 
