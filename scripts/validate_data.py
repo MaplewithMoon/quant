@@ -173,7 +173,8 @@ MULTI_SCHEMA_DECLARED = {
     "financial": "同一目录下按前缀分三张报表（balance_/profit_/cashflow_），列数本就不同",
     "industry": "三张不同的表：stock_industry（当前行业快照）、sw_l1（申万一级清单）、"
                 "sw_member（申万成分分级，带 in_date/out_date，PIT 行业归属的原料）",
-    "stocks": "all（tushare 当前列表）与 data（旧管线产物）是两种 schema",
+    "stocks": "all（证券主表：L/D/P 三状态 + exchange/delist_date）"
+              "与 data（旧管线产物，只有 code/name/list_status）是两种 schema",
 }
 
 

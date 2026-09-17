@@ -37,12 +37,21 @@ class UniverseSpec:
     exclude_st: bool = True
     exclude_suspended: bool = True
     # 剔除"涨跌停规则不可靠"的 (代码, 日期)，见 database/defects.py::C1。
-    # 默认 True：宁可少回测一段，也不拿不可靠的涨跌停价出结论。
+    # ⚠️ 这已是**第二道保险** —— 主池的交易所过滤（exchanges）已经从根上
+    # 把北交所/新三板排除了。保留它是为了在显式纳入 BSE 时不至于失控。
     exclude_unreliable: bool = True
+    # 证券主表三层过滤（时点正确的可交易池），见 database/master.py。
+    # 默认只保留沪深两市：北交所在 2021-11-15 开市前是新三板遗留代码，
+    # 涨跌停价不可信（C1），且流动性差一个量级会让容量分析失真。
+    use_master: bool = True
+    exchanges: tuple = ("SSE", "SZSE")
     top_n: int = 0                # 按流动性取前 N（0=不限）
 
     def describe(self) -> str:
         parts = [f"指数={self.index_code or '全市场'}"]
+        if self.use_master:
+            parts.append("主表三层过滤"
+                         f"({'/'.join(self.exchanges) if self.exchanges else '全交易所'})")
         if self.min_listed_days:
             parts.append(f"上市≥{self.min_listed_days}日")
         if self.min_amount:
@@ -186,19 +195,56 @@ def suspended_panel(dates: pd.DatetimeIndex, codes) -> pd.DataFrame:
 # ============================================================
 # 股票池
 # ============================================================
-def listed_days_panel(panel: dict) -> pd.DataFrame:
-    """每只股票截至当日的累计有效交易 bar 数（近似上市天数）"""
+def listed_days_panel(panel: dict, master=None) -> pd.DataFrame:
+    """每个交易日、每只股票「已上市多少个交易日」
+
+    ⚠️ 原先的实现是 `close.notna().cumsum()` —— 数的是**有行情的 bar 数**，
+    不是**上市后的交易日数**。两者在"本地数据从中间某年才开始"时差很远：
+    一只 2005 年上市、但本地数据只从 2015 年起的股票，2016 年的 bar 数只有
+    两百多，会被 `min_listed_days=120` 这类规则误判。
+
+    正确口径是拿证券主表的 `list_date`，在**全市场交易日历**上数交易日。
+    ⚠️ 不能用"面板内的位置"来数 —— 面板往往只覆盖回测区间（比如 30 天），
+    那样算出来永远是 1..30，跟上市多久毫无关系。必须借
+    `database.calendar` 的完整日历。
+
+    主表不可用时退回 bar 计数，并保留这个已知偏差。
+
+    返回：>= 0 的整数宽表；上市前为 0。
+    """
+    from database.calendar import trading_days
     from factors.panel import adjusted_close
     close = adjusted_close(panel)
+    idx = close.index
+
+    from database.master import load_master, master_capabilities
+    m = load_master() if master is None else master
+    if master_capabilities(m).get("list_date"):
+        cal = trading_days()
+        if len(cal):
+            ld = (m.drop_duplicates("code").set_index("code")["list_date"]
+                  .reindex([str(c).zfill(6) for c in close.columns]))
+            # 每个面板日在全市场日历上的位置
+            t_pos = cal.searchsorted(idx.values.astype("datetime64[ns]"), "left")            # 每只股票首个 >= list_date 的交易日位置
+            s_pos = cal.searchsorted(ld.values.astype("datetime64[ns]"), "left")
+            days = t_pos[:, None] - s_pos[None, :] + 1
+            days = np.where(np.isnat(ld.values)[None, :], 0, days)
+            return pd.DataFrame(np.maximum(days, 0), index=idx,
+                                columns=close.columns)
     return close.notna().cumsum()
 
 
-def build_universe(panel: dict, spec: UniverseSpec = None, **kw) -> pd.DataFrame:
+def build_universe(panel: dict, spec: UniverseSpec = None,
+                   master=None, **kw) -> pd.DataFrame:
     """构造逐日股票池掩码（宽表 bool，True=当日可选）
 
     参数:
         panel: factors.panel.load_panel() 的产出
         spec:  UniverseSpec；也可用关键字直接覆盖，如 build_universe(panel, index_code="000300.SH")
+        master: 证券主表。None = 读 `frozen/stocks`。
+                ⚠️ 显式传入是为了**可测**：合成代码（测试里造的面板）在真实主表
+                里查不到，会被"主表查不到即不可交易"这条规则整池剔掉；
+                测试应当传一份与之匹配的合成主表，而不是让结果依赖本机有没有数据。
     """
     if spec is None:
         spec = UniverseSpec(**kw)
@@ -212,9 +258,34 @@ def build_universe(panel: dict, spec: UniverseSpec = None, **kw) -> pd.DataFrame
     mask = close.notna()                       # 有行情
     mask &= close.shift(1).notna()             # 至少两根 bar（能算收益）
 
+    # ---- 证券主表三层过滤（时点正确的可交易池）----
+    #
+    # 这一步是股票池的**地基**，必须在最前面：exchang/list_date/delist_date
+    # 全是日期比较，不含任何"今天叫什么名字/今天属于哪个交易所"。
+    # 以前这里只有 `close.notna()`，等于把"有没有行情"当成"该不该交易" ——
+    # 而交易所归属这一条它根本表达不了（北交所/新三板照进不误）。
+    if spec.use_master:
+        from database.master import master_capabilities, tradable_mask
+        cap = master_capabilities(master)
+        if cap["pit_ready"]:
+            mask &= tradable_mask(dates, codes, exchanges=spec.exchanges,
+                                  master=master)
+        elif cap["has_master"]:
+            # ⚠️ 不静默放行：主表**存在**但缺 exchange/delist_date 时，
+            # 三层过滤做不了，放行会引入幸存者偏差与不可交易标的。明说。
+            import warnings
+            warnings.warn(
+                "证券主表缺少 exchange/delist_date，无法做时点正确的可交易池过滤；"
+                "本次股票池未应用主表约束（结果可能含不可交易标的）。"
+                "修复：python -c \"from database.downloader.stocks import "
+                "StockListDownloader; StockListDownloader().download()\"",
+                RuntimeWarning, stacklevel=2)
+        # 完全没有主表（CI / 全新检出）不警告：那是"没数据"而不是"数据坏了"，
+        # 此时上层本来就没有行情面板可跑。
+
     # 上市天数
     if spec.min_listed_days:
-        mask &= listed_days_panel(panel) >= spec.min_listed_days
+        mask &= listed_days_panel(panel, master=master) >= spec.min_listed_days
 
     # 流动性
     if spec.min_amount and "amount" in panel:

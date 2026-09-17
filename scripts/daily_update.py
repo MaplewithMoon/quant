@@ -52,6 +52,21 @@ CORRUPT_FOUND: set = set()
 
 
 def live_codes():
+    """当前仍在上市的代码（供数据更新）
+
+    ⚠️ 以前是 `st[~st["name"].str.contains("退")]` —— 拿**名字里有没有『退』**
+    当判据。它既漏（改名/重组/被吸收合并退市的不带"退"）又错
+    （退市整理期带"退"但仍在交易）。现在走证券主表的 `delist_date`：
+    一个纯粹的日期比较，见 `database/master.py`。
+
+    这里**不按交易所过滤**：数据要下全（北交所的行情也是数据），
+    至于哪些进回测池由 `universe.pool.UniverseSpec.exchanges` 决定。
+    """
+    from database.master import live_codes as _live
+    codes = _live()
+    if codes:
+        return codes
+    # 主表不可用时的兜底（老数据只有 name 列）
     st = pd.read_parquet(FROZEN / "stocks" / "year=2005" / "all.parquet")
     st = st[~st["name"].astype(str).str.contains("退", na=False)]
     return sorted(st["code"].astype(str).tolist())

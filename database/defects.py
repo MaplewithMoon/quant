@@ -107,14 +107,16 @@ DEFECTS: List[KnownDefect] = [
                "套用北交所 ±30% 规则算出的涨跌停价没有意义；实测 `pre_close` "
                "大量缺失（238 行）或异常（约 40 行价格 < 0.5 元），集中在 2008–2022 年。"
                "更危险的方向是**偏宽松**：涨跌停价算错会让引擎拦不住本该封板的成交。",
-        severity="中",
+        severity="低",
         needs_data=True,
-        mitigation="`limit_up/limit_down` 置为 NaN（= 无涨跌停限制）并由故障注册表"
-                   "把这些 (代码, 日期) 排除出可交易股票池；"
-                   "根治需要可靠的新三板历史行情/规则数据。",
+        mitigation="**主池已从根上排除**：`universe.pool` 默认走证券主表三层过滤，"
+                   "`exchange in ('SSE','SZSE')` 天然不含北交所/新三板"
+                   "（见 `database/master.py`）。涨跌停价本身仍置 NaN 作为诚实标记；"
+                   "`unreliable_limit_mask` 保留为第二道保险（显式纳入 BSE 时生效）。"
+                   "根治（让 BSE 也能用）仍需可靠的新三板历史行情/规则数据。",
         date_range=(None, "2021-11-14"),
         prefixes=BSE_PREFIXES,
-        doc_ref="2.9 / 三·C1",
+        doc_ref="2.18",
     ),
     KnownDefect(
         key="B7",
