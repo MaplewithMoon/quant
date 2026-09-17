@@ -73,6 +73,14 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
   **写入方**，都不算消费方。
 - **不要用 `ts.set_token()`**：它会往 `C:\Users\<user>\tk.csv` 写文件，
   受限环境直接 PermissionError。用 `ts.pro_api(token)`，语义一样。
+- **说「某数据拿不到」之前，先把相关接口都列一遍。** B7 曾被判成"tushare 无
+  历史行业归属接口"，实际只看了一个（`stock_basic.industry`，当前快照），
+  而 `index_member_all` 一直就有 `in_date`/`out_date`。类似地
+  `index_member`（带进出日期）无权限，但申万成分分级是另一回事。
+- **tushare 的单次调用上限会伪装成"数据就这么少"。** 已经踩过两次：
+  `opt_daily` 一把取恒定 15,000 行、`index_member_all` 默认恒定 3,000 行
+  （且只返回 `is_new='Y'`，历史一条没有）。**看到"刚好整千整万"就怀疑截断**，
+  用 `limit`/`offset` 翻页验证。
 - `db/cleaned/` 的重建是**就地覆盖**，中途失败会留下**半新半旧**的层
   （按文件名排序，前面的股票是新数据、后面的是旧数据，而文件数完全正常）。
   所以重建前必须备份，失败必须回滚。

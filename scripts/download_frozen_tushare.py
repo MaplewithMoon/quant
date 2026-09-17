@@ -286,6 +286,70 @@ def fetch_opt_basic(pro) -> pd.DataFrame:
     return out.drop_duplicates(subset=["ts_code"])
 
 
+def fetch_sw_member(pro) -> pd.DataFrame:
+    """取申万行业成分（分级）`index_member_all` —— **带进出日期的 PIT 原料**
+
+    ⚠️ 这个接口有个和 `opt_daily` 同款的坑：**单次调用恒定返回 3000 行**。
+    直接 `pro.index_member_all()` 实测正好 3000 行、`is_new` 全是 `Y`、
+    `out_date` 100% 缺失 —— A 股有 5,400+ 只，也就是说**默认调用是截断的**，
+    而且一条历史记录都没拿到。必须用 `limit` + `offset` 翻页。
+
+    两组数据合起来才是完整历史：
+        is_new='Y'  5,906 行 / 5,906 只   当前有效（`out_date` 恒空）
+        is_new='N'  2,006 行 / 1,646 只   已剔除  （`out_date` 恒非空）
+    1,646 只股票有 ≥2 段行业区间（最多 6 段），所以 Y∪N 能拼出逐股区间序列。
+    合计仅 7,912 行、约 4 次调用。
+
+    为什么需要它：`stock_basic.industry` 只是**当前快照**，拿它做行业中性化
+    等于用"现在的行业归属"去回测历史 —— 对换过行业的 1,646 只股票构成**前视**。
+    """
+    limiter = RateLimiter(200)
+    frames = []
+    for is_new in ("Y", "N"):
+        off, got = 0, 0
+        while True:
+            try:
+                d = api_call(pro, "index_member_all", limiter,
+                             is_new=is_new, limit=3000, offset=off)
+            except Exception as e:
+                print(f"  [sw_member] is_new={is_new} offset={off} 失败: "
+                      f"{str(e)[:60]}", flush=True)
+                break
+            if d is None or d.empty:
+                break
+            frames.append(d)
+            got += len(d)
+            if len(d) < 3000:
+                break
+            off += 3000
+        print(f"  [sw_member] is_new={is_new}: {got:,} 行"
+              f"（{'已到末页' if got % 3000 else '⚠ 可能仍被截断，请核对'}）",
+              flush=True)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    return out.drop_duplicates(subset=["ts_code", "l1_code", "in_date"])
+
+
+def _write_sw_member(pro) -> int:
+    """下载并写入 `frozen/industry/year=2005/sw_member.parquet`"""
+    from database.config import NON_ANNUAL_YEAR
+    d = FROZEN / "industry" / f"year={NON_ANNUAL_YEAR}"
+    d.mkdir(parents=True, exist_ok=True)
+    df = fetch_sw_member(pro)
+    if df.empty:
+        print("[sw_member] 未取到数据", flush=True)
+        return 0
+    from database.storage import atomic_to_parquet
+    atomic_to_parquet(df, d / "sw_member.parquet")
+    n_y = int((df["is_new"] == "Y").sum())
+    n_n = int((df["is_new"] == "N").sum())
+    print(f"[sw_member] 已写入 {len(df):,} 行（当前 {n_y:,} / 历史 {n_n:,}），"
+          f"{df['ts_code'].nunique():,} 只股票，{df['l1_name'].nunique()} 个 L1 行业",
+          flush=True)
+    return len(df)
+
+
 def download_options(pro):
     (FROZEN / "options").mkdir(parents=True, exist_ok=True)
     basic = fetch_opt_basic(pro)
@@ -300,7 +364,8 @@ def download_options(pro):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", choices=["adjust", "st", "valuation", "etf",
-                                           "options", "opt_basic", "all"],
+                                           "options", "opt_basic", "sw_member",
+                                           "all"],
                         default="all")
     parser.add_argument("--codes", default="", help="指定股票")
     parser.add_argument("--fresh", action="store_true", help="忽略断点，从头重新下载")
@@ -323,6 +388,11 @@ def main():
         basic.to_parquet(FROZEN / "options" / "opt_basic.parquet", index=False)
         print(f"[opt_basic] 已写入 {len(basic):,} 个合约（全交易所），"
               f"日线与断点未改动", flush=True)
+        return
+
+    # 只补申万行业成分（PIT 行业归属的原料）：7,912 行、约 4 次调用
+    if args.only == "sw_member":
+        _write_sw_member(pro)
         return
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()]

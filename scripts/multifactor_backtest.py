@@ -201,8 +201,24 @@ def main():
                                lag_days=args.lag_days, verbose=True)
     print(f"  因子 {len(factors)} 个（PIT 对齐 {time.time()-t1:.0f}s）")
 
-    from analytics.attribution import load_industry_map, _industry_series
-    panel_ind = _industry_series(load_industry_map(), close.columns)
+    # 行业归属：**优先用 PIT**（index_member_all 建的逐日行业面板）
+    #
+    # 用当前快照（stock_basic.industry）做历史中性化是**前视**：全库有 1,646 只
+    # 股票换过行业（最多 6 段），拿"它现在属于哪个行业"去中性化它十年前的因子值，
+    # 等于把未来信息提前用了。PIT 面板用 `in_date`/`out_date` 还原当时的归属。
+    from database.industry import has_pit_data, industry_pit_panel
+    if has_pit_data():
+        panel_ind = industry_pit_panel(reb, close.columns)
+        print(f"  行业归属: PIT 面板 {panel_ind.shape[0]} 调仓日 × "
+              f"{panel_ind.shape[1]} 只（{panel_ind.attrs['source']}）"
+              f"  覆盖率 {panel_ind.attrs['pit_coverage']:.1%}"
+              f"  快照兜底 {panel_ind.attrs['snapshot_fallback_ratio']:.2%}")
+    else:
+        from analytics.attribution import _industry_series, load_industry_map
+        panel_ind = _industry_series(load_industry_map(), close.columns)
+        print("  ⚠ 行业归属: **当前快照**（对换过行业的股票构成前视）")
+        print("     补 PIT 数据: python scripts/download_frozen_tushare.py "
+              "--only sw_member")
     mv = panel.get("total_mv")
 
     # ---- 已知数据缺陷附注 ----

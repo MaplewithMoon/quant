@@ -382,7 +382,7 @@ def load_all_factors(panel: dict, dates: pd.DatetimeIndex, codes,
 
 
 def neutralized_score(factors: Dict[str, pd.DataFrame], names: List[str],
-                      mask: pd.DataFrame, ind_map: pd.Series = None,
+                      mask: pd.DataFrame, ind_map=None,
                       mv: pd.DataFrame = None, n_size: int = 5,
                       weights: Dict[str, float] = None) -> pd.DataFrame:
     """把多个因子合成一个横截面打分（越大越看多）
@@ -394,6 +394,10 @@ def neutralized_score(factors: Dict[str, pd.DataFrame], names: List[str],
         4. 在**行业内**和**市值组内**减去均值（秩中性化）
            —— 不做这一步，"营收增速有效"很可能只是"这个行业这两年好"
         5. 按 weights 加权平均（默认等权）
+
+    `ind_map` 可以是 `pd.Series`（时不变，当前快照）或 `pd.DataFrame`
+    （**PIT**，index=日期 columns=代码）。**强烈建议用 PIT 面板**：
+    用当前快照做历史中性化是前视，详见 `database/industry.py`。
 
     ⚠️ 因子权重不在这里优化。样本内优化权重是过拟合的头号来源，
     而且上一轮的实验已经证明（docs/板块轮动改进报告.md）
@@ -465,11 +469,65 @@ def _demean_by_quintile(r: pd.DataFrame, mv: pd.DataFrame,
     return r - gm.fillna(0.0)
 
 
-def _neutralize_panel(r: pd.DataFrame, ind_map: pd.Series,
+def _group_demean_pit(r: pd.DataFrame, ind_panel: pd.DataFrame) -> pd.DataFrame:
+    """按**逐日**行业分组去均值（PIT：行业归属随时间变）
+
+    ⚠️ 为什么不能"逐日 groupby"：这个文件里已经踩过同款坑 ——
+    逐行 groupby + 带标签 setitem，11 个因子 × 2596 行 = 2.8 万次操作，
+    实测 30 分钟跑不完一轮。
+
+    这里利用一个实测事实：**行业归属只在极少数日期发生变化**
+    （全库仅 2,006 次变动，5,906 只股票里 4,260 只从未变过）。
+    所以把日期按"行业配置快照"分块，**每块内部仍用原来的向量化实现**，
+    块数 ≈ 变动次数，而不是日期数。
+
+    只有"变过行业"的股票参与快照指纹 —— 恒定不变的那些对分组没有贡献，
+    把它们排除能把指纹矩阵从 5,900 列降到约 1,600 列。
+    """
+    p = ind_panel.reindex(index=r.index, columns=r.columns)
+    if p.empty:
+        return r
+    nun = p.nunique(dropna=False)
+    varying = nun[nun > 1].index
+    if len(varying) == 0:
+        # 行业完全不变 -> 退化成时不变分组（快路径）
+        g = p.iloc[0]
+        g.index = r.columns
+        return _group_demean(r, g)
+
+    sub = p[varying].fillna(UNKNOWN_INDUSTRY_NAME).astype(str)
+    # 逐列 factorize 后比较整数行：比 np.unique(axis=0) 处理 object 数组快得多
+    arr = np.column_stack([pd.factorize(sub[c])[0] for c in sub.columns])
+    _, inv = np.unique(arr, axis=0, return_inverse=True)
+    out = pd.DataFrame(np.nan, index=r.index, columns=r.columns)
+    for k in np.unique(inv):
+        rows = r.index[inv == k]
+        g = p.loc[rows[0]]
+        g.index = r.columns
+        out.loc[rows] = _group_demean(r.loc[rows], g)
+    return out
+
+
+# 与 analytics.attribution.UNKNOWN_INDUSTRY 保持一致（避免循环 import）
+UNKNOWN_INDUSTRY_NAME = "未分类"
+
+
+def _neutralize_panel(r: pd.DataFrame, ind_map,
                       mv: pd.DataFrame, n_size: int = 5) -> pd.DataFrame:
-    """对整块秩面板做行业 + 市值中性（逐行去组均值）"""
+    """对整块秩面板做行业 + 市值中性（逐行去组均值）
+
+    `ind_map` 支持两种形态：
+      - `pd.Series`（index=代码）：**时不变**行业归属（当前快照）。
+      - `pd.DataFrame`（index=日期, columns=代码）：**PIT** 行业面板，
+        每个调仓日用它**当天**的行业归属。
+        ⚠️ 用当前快照做历史中性化是前视（B7）：换过行业的股票会拿到
+        它当时还不属于的那个行业的均值。全库有 1,646 只股票换过行业。
+    """
     if ind_map is not None and len(ind_map):
-        r = _group_demean(r, ind_map)
+        if isinstance(ind_map, pd.DataFrame):
+            r = _group_demean_pit(r, ind_map)
+        else:
+            r = _group_demean(r, ind_map)
     if mv is not None and not mv.empty:
         r = _demean_by_quintile(r, mv.reindex(index=r.index, columns=r.columns),
                                 n_size)

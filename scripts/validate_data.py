@@ -171,7 +171,8 @@ def check_schema(dataset: str, quick=False):
 # （例如某个下载器用不同列集写了同一目录）仍然会被抓到。
 MULTI_SCHEMA_DECLARED = {
     "financial": "同一目录下按前缀分三张报表（balance_/profit_/cashflow_），列数本就不同",
-    "industry": "stock_industry（个股行业归属）与 sw_l1（申万一级清单）是两张不同的表",
+    "industry": "三张不同的表：stock_industry（当前行业快照）、sw_l1（申万一级清单）、"
+                "sw_member（申万成分分级，带 in_date/out_date，PIT 行业归属的原料）",
     "stocks": "all（tushare 当前列表）与 data（旧管线产物）是两种 schema",
 }
 

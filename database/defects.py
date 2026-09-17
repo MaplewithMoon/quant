@@ -118,16 +118,20 @@ DEFECTS: List[KnownDefect] = [
     ),
     KnownDefect(
         key="B7",
-        title="行业分类是「当前快照」，没有历史变更记录",
-        scope="全部日期（frozen/industry 只有一份当前归属）",
-        impact="用**现在**的行业归属去回测历史，等于知道这家公司后来被划到哪个行业。"
-               "对行业中性化类策略构成**前视**：行业均值里混入了未来信息。"
-               "影响强度远小于幸存者偏差，但不是零。",
-        severity="中",
-        needs_data=True,
-        mitigation="无法在代码层消除；回测报告应标注。"
-                   "根治需要历史行业归属数据（tushare 无此接口）。",
-        doc_ref="一·B7",
+        title="行业分类曾是「当前快照」—— 已用 index_member_all 建成 PIT 表",
+        scope="全部日期（历史部分已由 frozen/industry/sw_member 覆盖）",
+        impact="用**现在**的行业归属去回测历史，等于知道这家公司后来被划到哪个"
+               "行业，对行业中性化类策略构成**前视**。全库有 1,646 只股票换过"
+               "行业（最多 6 段），影响不是边角。",
+        severity="低",
+        needs_data=False,
+        mitigation="已引入 `index_member_all`（带 in_date/out_date/is_new）"
+                   "建 PIT 行业面板 `database/industry.py`：5,906 只 / 31 个 L1、"
+                   "7,912 条区间。记录空档按「未观测到变更 ⇒ 视为未变更」沿用"
+                   "上一段（而不是跳到当前快照，那才是前视）。"
+                   "`neutralized_score` 与多因子回测已改用 PIT 面板，"
+                   "并在报告里打印覆盖率与快照兜底比例。",
+        doc_ref="一·B7 / 2.17",
     ),
     KnownDefect(
         key="B9",
