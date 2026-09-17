@@ -64,7 +64,7 @@ def fmt_num(x):
 
 
 def run_one(panel, mask, score, spec_kwargs, engine_kwargs, warmup_start,
-            eval_start, eval_end, capital, risk_config=None):
+            eval_start, eval_end, capital, risk_config=None, ctx=None):
     """跑一段回测并截断到评估窗口
 
     ⚠️ `risk_config` 传的是**配置**而不是已建好的 RiskManager：
@@ -83,13 +83,20 @@ def run_one(panel, mask, score, spec_kwargs, engine_kwargs, warmup_start,
     tw = build_target_weights(sc, mk, **spec_kwargs)
     eng = PortfolioBacktestEngine(**engine_kwargs)
     from risk import build_risk_manager
-    res = eng.run(sub, tw, risk_manager=build_risk_manager(risk_config))
+    res = eng.run(sub, tw, risk_manager=build_risk_manager(risk_config),
+                  context=ctx) if ctx is not None else \
+        eng.run(sub, tw, risk_manager=build_risk_manager(risk_config))
     ts = pd.Timestamp(eval_start)
     eq = res.equity[res.equity.index >= ts]
     tr = res.trades
     if tr is not None and not tr.empty and "timestamp" in tr.columns:
         tr = tr[pd.to_datetime(tr["timestamp"]) >= ts]
     m = Metrics.compute(eq, tr) if not eq.empty else Metrics()
+    # ⚠️ 把结果对象的 equity/metrics 换成**评估窗口**（截掉预热期）的那份：
+    # 引擎内部算的 metrics 覆盖 warmup_start~eval_end 全程，直接拿去渲染会
+    # 报出与脚本其它地方不一致的数字。统一口径后再交给渲染层。
+    res.equity = eq
+    res.metrics = m
     return {"equity": eq, "trades": tr, "metrics": m, "result": res,
             "target": tw, "ledger_gap": res.ledger_gap,
             "lookahead_violations": res.lookahead_violations,
@@ -221,12 +228,23 @@ def main():
               "--only sw_member")
     mv = panel.get("total_mv")
 
-    # ---- 已知数据缺陷附注 ----
-    # 这些约束以前只写在 docs/ 里，跑回测的人看不到。现在直接打在结果前面 ——
-    # 读者有权知道"这段结论踩着哪些已知问题"。
-    from database.defects import defects_in_window, format_banner
-    _def = defects_in_window(args.start, args.end)
-    print(format_banner(_def, indent="  "))
+    # ---- 回测上下文：用于**自动匹配已知缺陷**（见 database/defects.py）
+    # 行业来源如实填：用 PIT 就填 "pit"，用当前快照就填 "snapshot" ——
+    # 填错会让渲染层漏标/误标 B7（前视）那条。
+    ind_src = "pit" if has_pit_data() else "snapshot"
+    bt_ctx = {"start": args.start, "end": args.end,
+              # 本脚本股票池是**全市场**（不挂指数），所以 index_code=None；
+              # benchmark 只是对照基准，不是选股池，别混
+              "index_code": None,
+              "exchanges": ("SSE", "SZSE"),
+              "codes": list(close.columns),
+              "industry_source": ind_src}
+
+    # 早期一行提示（完整附注在最后的统一报告里，见 analytics/result_report.py）
+    from database.defects import match_defects
+    _def = match_defects(bt_ctx)
+    print(f"  ⚠ 已知缺陷: 本次触及 {len(_def)} 项 "
+          f"({', '.join(d.key for d in _def) or '无'})，详见结尾报告")
 
     # ---------- 2. 预注册规则挑因子 ----------
     banner("2. 因子集合（预注册规则 + 先验组合）", "-")
@@ -260,7 +278,7 @@ def main():
             r = run_one(panel, mask, score,
                         dict(n_hold=n, weighting="equal", rebalance=args.rebalance),
                         engine_kwargs, warmup, start, split, args.capital,
-                        risk_config=risk_config)
+                        risk_config=risk_config, ctx=bt_ctx)
             m = r["metrics"]
             print(f"    持股 {n:>3}  内 夏普 {fmt_num(m.sharpe_ratio)}  "
                   f"年化 {fmt_pct(m.annual_return)}  回撤 {fmt_pct(m.max_drawdown)}")
@@ -270,15 +288,15 @@ def main():
         tr = run_one(panel, mask, score,
                      dict(n_hold=n_best, weighting="equal", rebalance=args.rebalance),
                      engine_kwargs, warmup, start, split, args.capital,
-                     risk_config=risk_config)
+                     risk_config=risk_config, ctx=bt_ctx)
         te = run_one(panel, mask, score,
                      dict(n_hold=n_best, weighting="equal", rebalance=args.rebalance),
                      engine_kwargs, warmup, split, end, args.capital,
-                     risk_config=risk_config)
+                     risk_config=risk_config, ctx=bt_ctx)
         full = run_one(panel, mask, score,
                        dict(n_hold=n_best, weighting="equal", rebalance=args.rebalance),
                        engine_kwargs, warmup, start, end, args.capital,
-                       risk_config=risk_config)
+                       risk_config=risk_config, ctx=bt_ctx)
         print(f"    >>> 训练集最优持股数 {n_best}")
         print(f"    样本内: 夏普 {fmt_num(tr['metrics'].sharpe_ratio)} "
               f"年化 {fmt_pct(tr['metrics'].annual_return)} "
@@ -346,6 +364,11 @@ def main():
                   f"(p={vs_ctrl['alpha_pvalue']:.3f})")
             if key == "full":
                 print()
+                # **统一渲染**：缺陷附注 / 前视自检 / 风控触发 / 被拦委托
+                # 都由 analytics/result_report.py 出，脚本不再各印一套（T1·⑤）
+                print(r["result"].render(
+                    title=f"{label}（{R['names']}，持股 {R['n_hold']}）"
+                          f"  {args.start} ~ {args.end}"))
                 print(metrics_table(summ, BENCH_NAME))
                 ann = annual_returns_table(to_returns(ev), to_returns(b))
                 print(format_returns_table(ann, "分年度收益"))

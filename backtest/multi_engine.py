@@ -62,6 +62,18 @@ class MultiBacktestResult:
     lookahead_violations: int = 0      # >0 说明成交早于决策，必须查
     same_day_fills: int = 0            # fill=same_close 时的同日成交笔数
     risk_events: list = field(default_factory=list)   # 风控触发的记录
+    # ---- 标准结果对象（T1·⑤）----
+    # 把附注/口径/门禁挂在对象上、由**集中渲染层**统一输出，
+    # 而不是每个脚本各自 print（那是"接 N 次、漏 N-1 次"的病根）。
+    defects: list = field(default_factory=list)   # 自动匹配到的已知缺陷
+    context: dict = field(default_factory=dict)   # 回测输入（区间/指数/交易所…）
+    fill_timing: str = ""
+    gate: dict = field(default_factory=dict)      # 因子门禁结果（T1·③ 填）
+
+    def render(self, title: str = None, **kw) -> str:
+        """统一报告（渲染逻辑集中在 analytics/result_report.py）"""
+        from analytics.result_report import render_result
+        return render_result(self, title=title, **kw)
 
     def summary(self) -> str:
         m = self.metrics
@@ -118,6 +130,7 @@ class PortfolioBacktestEngine:
             exposure: Optional[pd.Series] = None,
             risk_manager=None,
             audit_lookahead: bool = True,
+            context: Optional[dict] = None,
             verbose: bool = False) -> MultiBacktestResult:
         """执行组合回测
 
@@ -139,6 +152,10 @@ class PortfolioBacktestEngine:
                     `audit_decision_inputs` 逐决策校验。引擎只能保证
                     "成交不早于决策"，但这一条恰恰是组合路径最容易出错的地方
                     （决策日和成交日共用一个日期索引）。
+            context: 额外回测输入，用于**自动匹配已知数据缺陷**。认得的键：
+                    index_code / exchanges / codes / industry_source。
+                    例如用了当前快照行业就传 `industry_source="snapshot"`，
+                    渲染层会自动附上 B7（前视）这条缺陷。
         """
         if exposure is not None:
             from factors.market import apply_exposure
@@ -215,13 +232,27 @@ class PortfolioBacktestEngine:
                     f"前视自检发现 {la_bad} 笔成交早于其决策日 —— "
                     f"回测结果不可信，请检查 fill_timing 与调仓日的对齐")
 
+        # 已知缺陷：按**回测输入**自动匹配（不依赖脚本作者记得手工挂）
+        ctx = dict(context or {})
+        ctx.setdefault("start", dates[0] if len(dates) else None)
+        ctx.setdefault("end", dates[-1] if len(dates) else None)
+        ctx.setdefault("codes", None)
+        try:
+            from database.defects import match_defects
+            matched = match_defects(ctx)
+        except Exception as e:                      # 匹配失败不能拖垮回测
+            self.logger.warning(f"已知缺陷自动匹配失败: {type(e).__name__}")
+            matched = []
+
         return MultiBacktestResult(equity=eq, trades=tdf, holdings=hdf,
                                    metrics=Metrics.compute(eq, tdf),
                                    rejections=rejects, ledger_gap=gap,
                                    lookahead_report=la_report,
                                    lookahead_violations=la_bad,
                                    same_day_fills=same_day,
-                                   risk_events=risk_events)
+                                   risk_events=risk_events,
+                                   defects=matched, context=ctx,
+                                   fill_timing=self.fill_timing)
 
     # ---------- 内部 ----------
     @staticmethod

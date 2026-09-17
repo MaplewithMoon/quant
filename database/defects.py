@@ -76,6 +76,9 @@ class KnownDefect:
     needs_data: True = 需要**额外数据源**才能根治（代码层面只能缓解）
     mitigation: 代码层面已经做了什么
     doc_ref:    文档章节
+    trigger:    可选。`trigger(ctx: dict) -> bool`，按**回测输入**自动判断
+                本次是否触及。有 trigger 的条目由 `match_defects()` 自动匹配，
+                不依赖每个脚本作者记得手工挂 —— 这是"接 N 次、漏 N-1 次"的解法。
     """
     key: str
     title: str
@@ -89,6 +92,7 @@ class KnownDefect:
     prefixes: Optional[tuple] = None
     boards: Optional[tuple] = None
     doc_ref: str = ""
+    trigger: Optional[object] = None      # Callable[[dict], bool]
 
     def covers(self, code=None, date=None, board=None) -> bool:
         """这条缺陷是否覆盖给定的 (代码, 日期, 板块)"""
@@ -116,6 +120,81 @@ class KnownDefect:
 # ============================================================
 # 注册表
 # ============================================================
+# ============================================================
+# 触发条件：按**回测输入**自动匹配（替代"每个脚本手工挂"）
+# ============================================================
+# ctx 里会用到的键（缺哪个就按"未触及"处理，不猜测）：
+#   start / end        回测区间
+#   index_code         股票池用的指数（None = 全市场）
+#   exchanges          交易所过滤（如 ("SSE","SZSE")）
+#   codes              池内代码（可选；可能很大，只在必要时遍历）
+#   industry_source    "pit" | "snapshot" | None
+#   fill_timing        成交时点
+def _win(ctx):
+    s, e = ctx.get("start"), ctx.get("end")
+    if s is None or e is None:
+        return None, None
+    return pd.Timestamp(s), pd.Timestamp(e)
+
+
+def _overlap(ctx, ds, de) -> bool:
+    """回测区间与缺陷区间是否有交集"""
+    s, e = _win(ctx)
+    if s is None:
+        return False
+    ds = pd.Timestamp(ds) if ds else pd.Timestamp("1900-01-01")
+    de = pd.Timestamp(de) if de else pd.Timestamp("2100-01-01")
+    return not (de < s or ds > e)
+
+
+def _any_prefix(ctx, prefixes) -> bool:
+    codes = ctx.get("codes")
+    if not codes:
+        return False
+    return any(str(c).zfill(6).startswith(tuple(prefixes)) for c in codes)
+
+
+def _trig_c1(ctx):
+    """池子里含北交所/新三板前缀 -> 涨跌停规则不可靠"""
+    if _any_prefix(ctx, BSE_PREFIXES):
+        return True
+    return bool(set(ctx.get("exchanges") or ()) & {"BSE", "NEEQ"})
+
+
+def _trig_b7(ctx):
+    """用了**当前快照**行业归属 -> 前视（用 PIT 面板则不触发）"""
+    return ctx.get("industry_source") == "snapshot"
+
+
+def _trig_b9(ctx):
+    """用了指数成分，且区间早于该指数快照覆盖起点"""
+    return bool(ctx.get("index_code")) and _overlap(ctx, None, "2016-05-31")
+
+
+def _trig_b10(ctx):
+    """用了指数成分 -> 只有月末快照，存在成分滞后"""
+    return bool(ctx.get("index_code"))
+
+
+def _trig_b11(ctx):
+    """`suspend_d` 不含"暂停上市"级长期停牌。全区间都可能受影响，
+    但只在区间足够长（≥1 年）时才值得提示，避免噪声。"""
+    s, e = _win(ctx)
+    return s is not None and (e - s).days >= 365
+
+
+def _trig_c2b(ctx):
+    """池子含已知的重新上市股"""
+    codes = {str(c).zfill(6) for c in (ctx.get("codes") or [])}
+    return bool(codes & set(RELISTED_CODES))
+
+
+def _trig_c4b(ctx):
+    """复牌首日不设涨跌幅：阈值经验性。区间足够长就可能触及长期停牌复牌。"""
+    s, e = _win(ctx)
+    return s is not None and (e - s).days >= 365
+
+
 DEFECTS: List[KnownDefect] = [
     KnownDefect(
         key="C1",
@@ -135,6 +214,7 @@ DEFECTS: List[KnownDefect] = [
         date_range=(None, "2021-11-14"),
         prefixes=BSE_PREFIXES,
         doc_ref="2.18",
+        trigger=_trig_c1,
     ),
     KnownDefect(
         key="B7",
@@ -152,6 +232,7 @@ DEFECTS: List[KnownDefect] = [
                    "`neutralized_score` 与多因子回测已改用 PIT 面板，"
                    "并在报告里打印覆盖率与快照兜底比例。",
         doc_ref="一·B7 / 2.17",
+        trigger=_trig_b7,
     ),
     KnownDefect(
         key="B9",
@@ -165,6 +246,7 @@ DEFECTS: List[KnownDefect] = [
                    "不产生错数据，只是覆盖不到。",
         date_range=(None, "2016-05-31"),
         doc_ref="一·B9",
+        trigger=_trig_b9,
     ),
     KnownDefect(
         key="B10",
@@ -183,6 +265,7 @@ DEFECTS: List[KnownDefect] = [
                    "按调整日批量导出；② 中证指数官网历次样本调整公告（Excel/PDF），"
                    "沪深300/中证500/中证1000 各约 40 次调整，一次性建设。",
         doc_ref="2.19",
+        trigger=_trig_b10,
     ),
     KnownDefect(
         key="B11",
@@ -196,6 +279,7 @@ DEFECTS: List[KnownDefect] = [
         mitigation="价格面板缺失 -> 无法成交，实际已被兜住；"
                    "根治需要另一路停牌数据源。",
         doc_ref="一·B11",
+        trigger=_trig_b11,
     ),
     KnownDefect(
         key="C2b",
@@ -214,6 +298,7 @@ DEFECTS: List[KnownDefect] = [
                    "完整名单需每年核对交易所公告（低速变更集合）。",
         codes=["601399", "001267", "601155"],
         doc_ref="2.19",
+        trigger=_trig_c2b,
     ),
     KnownDefect(
         key="C4b",
@@ -234,6 +319,7 @@ DEFECTS: List[KnownDefect] = [
                    "（771 个复牌日中 0 个有 R 记录），所以判定只能靠 K 线间隔。",
         date_range=("1990-01-01", None),
         doc_ref="2.19",
+        trigger=_trig_c4b,
     ),
 ]
 
@@ -271,7 +357,9 @@ def defects_in_window(start, end, board=None, codes=None) -> List[KnownDefect]:
     """回测窗口 [start, end] 触及的已知缺陷
 
     判断口径：缺陷区间与回测窗口**有交集**即算触及（宁可多标注）。
-    这是给回测报告自动附注用的 —— 读者有权知道"这段结论踩着哪些已知问题"。
+    这是**纯日期**的粗筛，保留它是为了避免展示与本次区间无关的噪声。
+    更准的匹配请用 `match_defects(ctx)` —— 它还看指数成分、行业来源、
+    交易所过滤等回测输入。
     """
     s, e = pd.Timestamp(start), pd.Timestamp(end)
     out = []
@@ -284,6 +372,33 @@ def defects_in_window(start, end, board=None, codes=None) -> List[KnownDefect]:
                 continue
         out.append(dfc)
     return out
+
+
+def match_defects(ctx: dict) -> List[KnownDefect]:
+    """按**回测输入**自动匹配触及的缺陷 —— 收敛"每个脚本手工挂"的做法
+
+    ctx 可用键（缺哪个就按"未触及"处理，不猜）：
+        start / end        回测区间
+        index_code         股票池用的指数（None = 全市场）
+        exchanges          交易所过滤，如 ("SSE","SZSE")
+        codes              池内代码（可选）
+        industry_source    "pit" | "snapshot" | None
+
+    返回按严重度排序的缺陷列表。
+
+    ⚠️ **没有 trigger 的条目不会被匹配到**，这是刻意的：宁可漏标，
+    也不要误标一片噪声让人对附注麻木。加新缺陷时请一并写 `trigger`。
+    """
+    hits = []
+    for d in DEFECTS:
+        try:
+            if d.trigger is not None and d.trigger(ctx):
+                hits.append(d)
+        except Exception:
+            # 触发条件自身出错不该让回测挂掉；但也**不能静默** —— 记为命中
+            hits.append(d)
+    order = {"高": 0, "中": 1, "低": 2}
+    return sorted(hits, key=lambda d: order.get(d.severity, 9))
 
 
 def unreliable_limit_mask(codes, dates) -> "pd.DataFrame":
@@ -333,5 +448,7 @@ def data_todo() -> List[KnownDefect]:
 
 
 __all__ = ["KnownDefect", "DEFECTS", "BSE_FROM", "BSE_SELECT_TIER_FROM",
-           "BSE_PREFIXES", "get", "defects_for", "defects_in_window",
-           "unreliable_limit_mask", "format_banner", "data_todo"]
+           "BSE_PREFIXES", "RELISTED_CODES", "RELISTED_ENTITIES",
+           "RESUMED_NOT_RELISTED", "get", "defects_for", "defects_in_window",
+           "match_defects", "unreliable_limit_mask", "format_banner",
+           "data_todo"]

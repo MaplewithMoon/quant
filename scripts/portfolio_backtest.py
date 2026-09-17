@@ -162,9 +162,15 @@ def main():
                 "min_exposure": args.derisk_min_exposure,
                 "max_turnover": args.max_turnover}
     rm = build_risk_manager(risk_cfg)
-    res = eng.run(panel, tw, risk_manager=rm)
+    # 走**标准结果对象**：缺陷附注 / 前视自检 / 风控触发 / 被拦委托
+    # 统一由 analytics/result_report.py 渲染，脚本不再各印一套（T1·⑤）
+    res = eng.run(panel, tw, risk_manager=rm,
+                  context={"index_code": args.index or None,
+                           "codes": list(close.columns),
+                           "industry_source": (None if args.no_attribution
+                                               else "snapshot")})
     print()
-    print(res.summary())
+    print(res.render(title=f"组合回测  {args.start} ~ {args.end}"))
 
     # ---- 6. 归因 ----
     if not args.no_attribution:
