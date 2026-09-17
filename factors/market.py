@@ -19,7 +19,9 @@
 
 【已知局限（都来自数据本身，不是实现）】
     - `northbound` 只有 2025-05 起的 300 行，**不能用于更早的回测**
-    - `options` 的 `opt_basic` 只覆盖 SSE（4.6% 的合约），PCR 只对这部分有效；
+    - `options` 的 `opt_basic` 只覆盖 SSE，PCR 只对这部分有效。**覆盖率不写死在
+      这里**（会随补下载变化），看 `load_option_pcr()` 返回值的
+      `attrs['coverage']` 与 `attrs['coverage_note']`；2026-09 实测约 5%，
       `download_frozen_tushare.py --only opt_basic` 可以补齐（只需 8 次调用）
     - `futures` 只有主连，没有各月份合约，算不了期限结构
 """
@@ -164,10 +166,10 @@ def load_option_pcr(start=None, end=None) -> pd.DataFrame:
     PCR 高 = 买认沽的多 = 情绪偏空（常用作**反向**指标）。
     返回: index=交易日, columns=[pcr_vol, pcr_oi, opt_vol, opt_oi]
 
-    ⚠️ 覆盖率限制：`opt_basic` 目前**只有 SSE**（12,000 个合约，占日线合约的
-    4.6%），所以这里算出来的 PCR 只代表上交所 ETF 期权。补齐要跑
-    `python scripts/download_frozen_tushare.py --only opt_basic`（8 次调用）。
-    覆盖率不足时会在返回值的 attrs 里标注 `coverage`。
+    ⚠️ 覆盖率限制：`opt_basic` 目前**只有 SSE**，所以这里算出来的 PCR 只代表
+    上交所 ETF 期权。覆盖率会写进返回值的 `attrs['coverage']` /
+    `attrs['coverage_note']` —— **不要把它当成全市场 PCR**。
+    补齐要跑 `python scripts/download_frozen_tushare.py --only opt_basic`（8 次调用）。
     """
     d = FROZEN_ROOT / "options"
     basic = d / "opt_basic.parquet"
