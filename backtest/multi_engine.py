@@ -58,6 +58,10 @@ class MultiBacktestResult:
     metrics: Metrics
     rejections: Dict[str, int] = field(default_factory=dict)
     ledger_gap: float = 0.0
+    lookahead_report: str = ""         # 成交时点前视自检报告
+    lookahead_violations: int = 0      # >0 说明成交早于决策，必须查
+    same_day_fills: int = 0            # fill=same_close 时的同日成交笔数
+    risk_events: list = field(default_factory=list)   # 风控触发的记录
 
     def summary(self) -> str:
         m = self.metrics
@@ -75,6 +79,17 @@ class MultiBacktestResult:
             L.append("  —— 被制度约束拦下的委托 ——")
             for k, v in sorted(self.rejections.items(), key=lambda kv: -kv[1]):
                 L.append(f"    {v:>6} 次  {k}")
+        if self.risk_events:
+            L.append("")
+            L.append("  —— 风控触发 ——")
+            for e in self.risk_events[:10]:
+                L.append(f"    {str(e.get('date'))[:10]}  {e.get('reason')}")
+            if len(self.risk_events) > 10:
+                L.append(f"    ... 另有 {len(self.risk_events) - 10} 次")
+        if self.lookahead_report:
+            L.append("")
+            L.append("  —— 前视自检 ——")
+            L.append(self.lookahead_report)
         L.append("=" * 74)
         return "\n".join(L)
 
@@ -101,6 +116,8 @@ class PortfolioBacktestEngine:
     # ---------- 主循环 ----------
     def run(self, panel: dict, target_weights: pd.DataFrame,
             exposure: Optional[pd.Series] = None,
+            risk_manager=None,
+            audit_lookahead: bool = True,
             verbose: bool = False) -> MultiBacktestResult:
         """执行组合回测
 
@@ -113,6 +130,15 @@ class PortfolioBacktestEngine:
                     缩放目标权重 —— 即择时只通过"这次调仓多买还是少买"生效，
                     调仓日之间不因为信号变化而临时加减仓（那会引入大量无谓交易，
                     也会把"信号噪声"当成调仓理由）。非调仓日与缺失日按 1.0 处理。
+            risk_manager: 组合层风控（`risk.PortfolioRiskManager`），在**每次调仓前**
+                    调整目标权重。注意这**不是** `risk.RiskManager`：那套规则签名是
+                    `check(signal: Signal, ...)`，是**单标的**语义，套不到权重宽表上。
+            audit_lookahead: 回测后做成交时点前视自检（默认开）。
+                    ⚠️ 策略**实际用了哪些数据**引擎无从得知 —— 那部分要由调用方用
+                    `backtest.lookahead.verify_point_in_time` 或
+                    `audit_decision_inputs` 逐决策校验。引擎只能保证
+                    "成交不早于决策"，但这一条恰恰是组合路径最容易出错的地方
+                    （决策日和成交日共用一个日期索引）。
         """
         if exposure is not None:
             from factors.market import apply_exposure
@@ -128,6 +154,8 @@ class PortfolioBacktestEngine:
         equity, trades, holds = [], [], []
         rejects: Dict[str, int] = {}
         pending = None      # (调仓日, 目标权重) —— next_open 模式下待执行
+        rebalance_dates = []          # 决策日（供前视自检）
+        risk_events = []              # 风控触发记录
 
         for i, d in enumerate(dates):
             pf.new_day()                     # T+1 解锁
@@ -143,6 +171,12 @@ class PortfolioBacktestEngine:
             row = tw.loc[d]
             is_reb = row.notna().any()
             if is_reb:
+                rebalance_dates.append(d)
+                # 组合层风控：在挂单**之前**调整目标权重
+                if risk_manager is not None:
+                    row, ev = risk_manager.adjust(
+                        row, portfolio=pf, date=d, holdings=pf.positions)
+                    risk_events.extend(ev)
                 if self.fill_timing == FILL_SAME_CLOSE:
                     ref = self._ref_prices(close, d)
                     self._rebalance(pf, row, ref, d, panel, trades, rejects)
@@ -167,9 +201,27 @@ class PortfolioBacktestEngine:
         if gap > 1e-6:
             self.logger.error(f"账目不变量被破坏: 权益 {eq.iloc[-1]:,.4f} "
                               f"!= 账户 {pf.total_value:,.4f} (差 {gap:,.4f})")
+
+        # 成交时点前视自检（引擎能自己保证的那部分 PIT）
+        la_report, la_bad, same_day = "", 0, 0
+        if audit_lookahead:
+            from backtest.lookahead import check_fill_timing
+            r = check_fill_timing(rebalance_dates, tdf, fill_timing=self.fill_timing)
+            la_report = r["report"]
+            la_bad = len(r["violations"])
+            same_day = r["same_day_fills"]
+            if la_bad:
+                self.logger.error(
+                    f"前视自检发现 {la_bad} 笔成交早于其决策日 —— "
+                    f"回测结果不可信，请检查 fill_timing 与调仓日的对齐")
+
         return MultiBacktestResult(equity=eq, trades=tdf, holdings=hdf,
                                    metrics=Metrics.compute(eq, tdf),
-                                   rejections=rejects, ledger_gap=gap)
+                                   rejections=rejects, ledger_gap=gap,
+                                   lookahead_report=la_report,
+                                   lookahead_violations=la_bad,
+                                   same_day_fills=same_day,
+                                   risk_events=risk_events)
 
     # ---------- 内部 ----------
     @staticmethod

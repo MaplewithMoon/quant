@@ -88,6 +88,14 @@ def main():
     ap.add_argument("--fill-timing", default=FILL_NEXT_OPEN,
                     choices=[FILL_NEXT_OPEN, FILL_SAME_CLOSE])
     ap.add_argument("--no-rules", action="store_true", help="关闭 A股制度约束")
+    ap.add_argument("--max-weight", type=float, default=0.0,
+                    help="单票权重上限，如 0.05（0=不启用）")
+    ap.add_argument("--max-drawdown", type=float, default=0.0,
+                    help="回撤降仓阈值，如 0.20（0=不启用）")
+    ap.add_argument("--derisk-min-exposure", type=float, default=0.0,
+                    help="回撤降仓的最低总仓位")
+    ap.add_argument("--max-turnover", type=float, default=0.0,
+                    help="单次调仓换手上限，如 0.5（0=不启用）")
     ap.add_argument("--no-attribution", action="store_true", help="跳过归因分析")
     ap.add_argument("--out", default="", help="净值曲线保存为 CSV")
     args = ap.parse_args()
@@ -147,7 +155,14 @@ def main():
         max_participation=args.max_participation,
         fill_timing=args.fill_timing,
         market_rules=MarketRules(enabled=not args.no_rules))
-    res = eng.run(panel, tw)
+    # 组合层风控（默认全关 = 保持原行为）
+    from risk import build_risk_manager
+    risk_cfg = {"max_weight": args.max_weight,
+                "max_drawdown_pct": args.max_drawdown,
+                "min_exposure": args.derisk_min_exposure,
+                "max_turnover": args.max_turnover}
+    rm = build_risk_manager(risk_cfg)
+    res = eng.run(panel, tw, risk_manager=rm)
     print()
     print(res.summary())
 

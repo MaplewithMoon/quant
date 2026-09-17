@@ -64,8 +64,15 @@ def fmt_num(x):
 
 
 def run_one(panel, mask, score, spec_kwargs, engine_kwargs, warmup_start,
-            eval_start, eval_end, capital):
-    """跑一段回测并截断到评估窗口"""
+            eval_start, eval_end, capital, risk_config=None):
+    """跑一段回测并截断到评估窗口
+
+    ⚠️ `risk_config` 传的是**配置**而不是已建好的 RiskManager：
+    `PortfolioRiskManager` 内部有 `_prev_weights` 状态（换手类规则要用它算
+    "相对上期的变动"），同一个实例跨 训练集/测试集/全区间 复用会让状态串味 ——
+    测试集的第一次调仓会拿训练集末尾的持仓当"上期持仓"，凭空触发换手限制。
+    所以每段回测都在这里现建一个。
+    """
     sub = {k: v.loc[(v.index >= pd.Timestamp(warmup_start))
                     & (v.index <= pd.Timestamp(eval_end))]
            for k, v in panel.items() if isinstance(v, pd.DataFrame)}
@@ -75,7 +82,8 @@ def run_one(panel, mask, score, spec_kwargs, engine_kwargs, warmup_start,
                   & (mask.index <= pd.Timestamp(eval_end))]
     tw = build_target_weights(sc, mk, **spec_kwargs)
     eng = PortfolioBacktestEngine(**engine_kwargs)
-    res = eng.run(sub, tw)
+    from risk import build_risk_manager
+    res = eng.run(sub, tw, risk_manager=build_risk_manager(risk_config))
     ts = pd.Timestamp(eval_start)
     eq = res.equity[res.equity.index >= ts]
     tr = res.trades
@@ -83,7 +91,9 @@ def run_one(panel, mask, score, spec_kwargs, engine_kwargs, warmup_start,
         tr = tr[pd.to_datetime(tr["timestamp"]) >= ts]
     m = Metrics.compute(eq, tr) if not eq.empty else Metrics()
     return {"equity": eq, "trades": tr, "metrics": m, "result": res,
-            "target": tw, "ledger_gap": res.ledger_gap}
+            "target": tw, "ledger_gap": res.ledger_gap,
+            "lookahead_violations": res.lookahead_violations,
+            "risk_events": res.risk_events}
 
 
 def main():
@@ -98,7 +108,23 @@ def main():
     ap.add_argument("--commission", type=float, default=0.0001)
     ap.add_argument("--stamp-duty", type=float, default=0.0005)
     ap.add_argument("--min-commission", type=float, default=5.0)
-    ap.add_argument("--slippage", type=float, default=0.0)
+    ap.add_argument("--slippage", type=float, default=0.001,
+                    help="固定滑点（--impact-model fixed 时用）。"
+                         "⚠️ 默认值原先是 0.0，见下方 C6 说明")
+    ap.add_argument("--impact-model", default="fixed", choices=["none", "fixed", "sqrt"],
+                    help="市场冲击模型。用 sqrt 时必须配合 --capital 做容量分析："
+                         "冲击 ∝ 下单量/成交量，资金越大衰减越快")
+    ap.add_argument("--impact-k", type=float, default=0.1,
+                    help="平方根冲击系数（--impact-model sqrt 时用）")
+    # 组合层风控（默认全关 = 保持原行为；要开就显式给阈值）
+    ap.add_argument("--max-weight", type=float, default=0.0,
+                    help="单票权重上限，如 0.05（0=不启用）")
+    ap.add_argument("--max-drawdown", type=float, default=0.0,
+                    help="回撤降仓阈值，如 0.20 表示回撤 20%% 时压到最低仓位（0=不启用）")
+    ap.add_argument("--derisk-min-exposure", type=float, default=0.0,
+                    help="回撤降仓的最低总仓位（配合 --max-drawdown）")
+    ap.add_argument("--max-turnover", type=float, default=0.0,
+                    help="单次调仓换手上限，如 0.5（0=不启用）")
     ap.add_argument("--min-listed-days", type=int, default=120)
     ap.add_argument("--min-amount", type=float, default=5e7)
     ap.add_argument("--rebalance", default="M")
@@ -122,9 +148,38 @@ def main():
                          min_commission=args.min_commission,
                          stamp_duty=args.stamp_duty, slippage=args.slippage)
 
+    # ⚠️ C6：这个脚本原先**完全没有接冲击成本模型**，而且 `--slippage` 默认 0.0。
+    # 后果是：把 --capital 从 100 万调到 1 亿，回测结果**一分钱都不会变** ——
+    # 也就是说 A4「turnover_20 的容量」根本无法用这个脚本验证。
+    # 现在按其他回测脚本的口径统一：fixed 滑点（默认 1bp），要评估容量就
+    # 换成 --impact-model sqrt（冲击 ∝ 下单量/成交量，会随资金规模放大）。
+    from execution.impact import build_model
+    if args.impact_model != "none":
+        engine_kwargs["slippage_model"] = build_model(
+            args.impact_model, rate=args.slippage, k=args.impact_k)
+
+    # 组合层风控配置（None = 不启用，行为与改动前一致）
+    risk_config = {
+        "max_weight": args.max_weight,
+        "max_drawdown_pct": args.max_drawdown,
+        "min_exposure": args.derisk_min_exposure,
+        "max_turnover": args.max_turnover,
+    }
+    if not any(risk_config.values()):
+        risk_config = None
+
     banner("多因子选股策略  |  训练/测试集分离  |  全部因子行业+市值中性")
     print(f"  训练集 {args.start} ~ {args.split}     测试集 {args.split} ~ {args.end}")
-    print(f"  资金 {args.capital:,.0f}   滑点 {args.slippage:.2%}   调仓 {args.rebalance}")
+    print(f"  资金 {args.capital:,.0f}   滑点 {args.slippage:.2%}   "
+          f"冲击模型 {args.impact_model}"
+          + (f"(k={args.impact_k})" if args.impact_model == "sqrt" else "")
+          + f"   调仓 {args.rebalance}")
+    if risk_config:
+        print(f"  组合风控: 单票上限 {args.max_weight or '—'}   "
+              f"回撤降仓 {args.max_drawdown or '—'}   "
+              f"换手上限 {args.max_turnover or '—'}")
+    else:
+        print("  组合风控: 未启用（--max-weight / --max-drawdown / --max-turnover 可开）")
 
     # ---------- 1. 数据 ----------
     banner("1. 加载数据", "-")
@@ -149,6 +204,13 @@ def main():
     from analytics.attribution import load_industry_map, _industry_series
     panel_ind = _industry_series(load_industry_map(), close.columns)
     mv = panel.get("total_mv")
+
+    # ---- 已知数据缺陷附注 ----
+    # 这些约束以前只写在 docs/ 里，跑回测的人看不到。现在直接打在结果前面 ——
+    # 读者有权知道"这段结论踩着哪些已知问题"。
+    from database.defects import defects_in_window, format_banner
+    _def = defects_in_window(args.start, args.end)
+    print(format_banner(_def, indent="  "))
 
     # ---------- 2. 预注册规则挑因子 ----------
     banner("2. 因子集合（预注册规则 + 先验组合）", "-")
@@ -181,7 +243,8 @@ def main():
         for n in n_grid:
             r = run_one(panel, mask, score,
                         dict(n_hold=n, weighting="equal", rebalance=args.rebalance),
-                        engine_kwargs, warmup, start, split, args.capital)
+                        engine_kwargs, warmup, start, split, args.capital,
+                        risk_config=risk_config)
             m = r["metrics"]
             print(f"    持股 {n:>3}  内 夏普 {fmt_num(m.sharpe_ratio)}  "
                   f"年化 {fmt_pct(m.annual_return)}  回撤 {fmt_pct(m.max_drawdown)}")
@@ -190,13 +253,16 @@ def main():
         n_best = best[0]
         tr = run_one(panel, mask, score,
                      dict(n_hold=n_best, weighting="equal", rebalance=args.rebalance),
-                     engine_kwargs, warmup, start, split, args.capital)
+                     engine_kwargs, warmup, start, split, args.capital,
+                     risk_config=risk_config)
         te = run_one(panel, mask, score,
                      dict(n_hold=n_best, weighting="equal", rebalance=args.rebalance),
-                     engine_kwargs, warmup, split, end, args.capital)
+                     engine_kwargs, warmup, split, end, args.capital,
+                     risk_config=risk_config)
         full = run_one(panel, mask, score,
                        dict(n_hold=n_best, weighting="equal", rebalance=args.rebalance),
-                       engine_kwargs, warmup, start, end, args.capital)
+                       engine_kwargs, warmup, start, end, args.capital,
+                       risk_config=risk_config)
         print(f"    >>> 训练集最优持股数 {n_best}")
         print(f"    样本内: 夏普 {fmt_num(tr['metrics'].sharpe_ratio)} "
               f"年化 {fmt_pct(tr['metrics'].annual_return)} "
@@ -204,6 +270,15 @@ def main():
         print(f"    样本外: 夏普 {fmt_num(te['metrics'].sharpe_ratio)} "
               f"年化 {fmt_pct(te['metrics'].annual_return)} "
               f"回撤 {fmt_pct(te['metrics'].max_drawdown)}")
+        # 前视自检：引擎能保证"成交不早于决策"。>0 就说明结果不可信，必须显眼。
+        la = full["lookahead_violations"]
+        if la:
+            print(f"    ⚠⚠ 前视自检发现 {la} 笔成交早于决策日 —— 本次结果不可信！")
+        else:
+            print("    ✓ 前视自检通过（成交均不早于决策日）")
+        if full["risk_events"]:
+            print(f"    风控触发 {len(full['risk_events'])} 次（"
+                  f"{full['risk_events'][0]['rule']} 等）")
         rows.append({
             "组合": label, "因子": ",".join(names), "持股数": n_best,
             "内年化": tr["metrics"].annual_return, "内夏普": tr["metrics"].sharpe_ratio,
@@ -212,6 +287,8 @@ def main():
             "外回撤": te["metrics"].max_drawdown,
             "外波动": te["metrics"].annual_volatility,
             "账目差额": full["ledger_gap"],
+            "前视违规": la,
+            "风控触发": len(full["risk_events"]),
         })
         results[label] = {"train": tr, "test": te, "full": full,
                           "names": names, "n_hold": n_best, "score": score}
@@ -305,6 +382,12 @@ def main():
             "因子集合": {k: v["names"] for k, v in results.items()},
             "持股数": {k: v["n_hold"] for k, v in results.items()},
             "对照": cmp.replace({np.nan: None}).to_dict("records"),
+            # 已知缺陷与护栏状态一并落盘：没有这些，报告数字脱离前提就没法解读
+            "已知缺陷": [{"key": d.key, "标题": d.title, "严重度": d.severity,
+                          "需额外数据": d.needs_data} for d in _def],
+            "交易成本": {"滑点": args.slippage, "冲击模型": args.impact_model,
+                         "impact_k": args.impact_k if args.impact_model == "sqrt" else None},
+            "组合风控": risk_config,
         }, fh, ensure_ascii=False, indent=2, default=str)
     print(f"\n  产出 -> {args.outdir}/")
     banner(f"完成，总用时 {time.time()-t0:.0f}s")

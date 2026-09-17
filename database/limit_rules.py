@@ -37,6 +37,10 @@ import numpy as np
 import pandas as pd
 
 BEIJING_PREFIXES = ("920", "43", "83", "87", "88")
+# 北交所开市日：此前这些前缀是**新三板**遗留代码，±30% 规则不适用（见 C1）。
+# 定义在 database/defects.py（故障注册表是唯一来源），这里转发以便就近引用。
+from .defects import (BSE_FROM, BSE_SELECT_TIER_FROM,  # noqa: E402
+                      RELISTED_CODES)
 STAR_PREFIXES = ("688", "689")          # 科创板
 GEM_PREFIXES = ("300", "301")           # 创业板
 
@@ -174,7 +178,8 @@ def listing_windows(list_dates: Dict[str, pd.Timestamp] = None,
 
     ⚠️ 已知局限：窗口起点取自 `frozen/stocks.list_date`。对于重新上市股，
     tushare 的 list_date 是重上市日、且这类股票不适用新股首日规则，会被误套
-    ±44%。区分它们需要一张"重新上市"名单，见文档 C2b。
+    ±44%。已知的 3 只（`601399`/`001267`/`601155`）通过 `RELISTED_CODES`
+    跳过；完整名单需要额外数据，见文档 C2b。
     """
     list_dates = list_dates if list_dates is not None else load_list_dates()
     cal = cal if cal is not None else trading_calendar()
@@ -182,6 +187,8 @@ def listing_windows(list_dates: Dict[str, pd.Timestamp] = None,
     if len(cal) == 0:
         return out
     for code, ld in list_dates.items():
+        if str(code).zfill(6) in RELISTED_CODES:
+            continue          # 重新上市股不适用新股首日规则（C2b）
         kind, n = listing_rule(code, ld)
         if kind is None:
             continue
@@ -385,6 +392,17 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
     # 创业板制度切换（按日）
     if str(code).zfill(6).startswith(GEM_PREFIXES):
         pct = np.where(dates < GEM_20PCT_FROM, 0.10, 0.20)
+    # 北交所：**开市前不适用 ±30%**（见 C1）
+    #   `920/43/83/87/88` 在 2021-11-15 之前是**新三板**遗留代码，北交所根本
+    #   还不存在；实测这段的 `pre_close` 大量缺失/异常（238 行缺失、约 40 行
+    #   价格 < 0.5 元，集中在 2008–2022）。硬套 ±30% 算出来的涨跌停价没有意义，
+    #   而且错的方向偏**宽松**（拦不住本该封板的成交）。
+    #   这里把这段标成"不可靠"-> 涨跌停置 NaN；并由 database/defects.py 的
+    #   `unreliable_limit_mask` 把这些 (代码, 日期) **排除出可交易股票池** ——
+    #   只置 NaN 会变成"随便交易"，那是把"不知道"当成了"没有涨跌幅限制"。
+    unreliable = np.zeros(len(out), dtype=bool)
+    if str(code).zfill(6).startswith(BEIJING_PREFIXES):
+        unreliable = (dates < BSE_FROM).to_numpy()
     # ST 区间覆盖（**只对主板**生效：创业板/科创板/北交所的 ST 仍走板块档位）
     # 2026-07-06 起主板 ST 也是 ±10%，与主板常规档位相同 -> 无需覆盖
     if st_map and board_of(code) == "MAIN":
@@ -392,7 +410,7 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
         pct = np.where(st, 0.05, pct)
 
     # 整数 tick 运算 + 四舍五入（交易所口径，非银行家舍入）
-    bad = ~(pc > 0)
+    bad = ~(pc > 0) | unreliable
     pc_t = _ticks(np.where(bad, 0.0, pc), tick)
     k_up, k_dn = _pct_factors(pct)
     up = _round_half_up(pc_t * k_up, PCT_DEN) * tick

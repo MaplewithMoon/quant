@@ -343,6 +343,8 @@ def set_option(key, value):
 
 def set_slippage(obj):
     _ENGINE.slippage_obj = obj
+    # 标记"策略显式设过滑点"：CLI 的默认滑点/冲击模型不应覆盖策略的显式选择
+    _ENGINE.slippage_set_by_strategy = True
 
 
 def set_order_cost(obj, type="stock"):
@@ -657,7 +659,9 @@ def order_target_percent(security, pct):
 class JQEngine:
     def __init__(self, data: JQData, initial_cash: float = 1_000_000,
                  fill: str = "auto", rules: bool = True,
-                 verbose: bool = False, volume_limit: bool = False):
+                 verbose: bool = False, volume_limit: bool = False,
+                 slippage: float = 0.001, impact_model: str = "none",
+                 impact_k: float = 0.1):
         global _ENGINE
         self.data = data
         self.initial_cash = float(initial_cash)
@@ -666,7 +670,15 @@ class JQEngine:
         self.g = GlobalNamespace()
         self.options: Dict = {}
         self.benchmark = "000300.XSHG"
-        self.slippage_obj = FixedSlippage(0.0)
+        # ⚠️ 原先这里是 `FixedSlippage(0.0)` —— 两个 Clone 策略的回测因此
+        # **零滑点、零冲击**，与聚宽对不上不只差在成交时点。现在默认 1bp，
+        # 并且可以换成平方根冲击模型；策略若显式调用 `set_slippage()`，
+        # 以策略为准（聚宽语义）。
+        self._default_slippage = float(slippage)
+        self._impact_model = impact_model
+        self._impact_k = float(impact_k)
+        self.slippage_set_by_strategy = False
+        self.slippage_obj = FixedSlippage(self._default_slippage)
         self.order_cost = OrderCost(open_commission=2.5e-4, close_commission=2.5e-4,
                                     close_tax=1e-3, min_commission=5.0)
         self.pf = Portfolio(self.initial_cash)
@@ -686,12 +698,20 @@ class JQEngine:
 
     # ---------- 费率/滑点 ----------
     def _rebuild_broker(self):
-        slip = float(getattr(self.slippage_obj, "per_side", 0.0))
-        self.broker = SimulatedBroker(
-            slippage=slip, commission=float(self.order_cost.open_commission),
-            min_commission=float(self.order_cost.min_commission),
-            stamp_duty=float(self.order_cost.close_tax),
-            transfer_fee=0.0, lot_size=100)
+        from execution.impact import build_model
+        common = dict(commission=float(self.order_cost.open_commission),
+                      min_commission=float(self.order_cost.min_commission),
+                      stamp_duty=float(self.order_cost.close_tax),
+                      transfer_fee=0.0, lot_size=100)
+        if self._impact_model != "none" and not self.slippage_set_by_strategy:
+            # 冲击模型（需成交量）：冲击 ∝ 下单量/成交量，会随资金规模放大
+            self.broker = SimulatedBroker(
+                slippage_model=build_model(self._impact_model,
+                                           rate=self._default_slippage,
+                                           k=self._impact_k), **common)
+        else:
+            slip = float(getattr(self.slippage_obj, "per_side", 0.0))
+            self.broker = SimulatedBroker(slippage=slip, **common)
         # 聚宽 close_commission 与 open_commission 可以不同，这里分别记账
         self._close_comm = float(self.order_cost.close_commission)
 
@@ -942,14 +962,20 @@ class JQEngine:
 # ============================================================
 def run_strategy(module, panel, start, end, initial_cash=1_000_000, fill="auto",
                  etf_yield=0.02, rules=True, verbose=False,
-                 volume_limit=False) -> dict:
+                 volume_limit=False, slippage=0.001,
+                 impact_model="none", impact_k=0.1) -> dict:
     """跑一个聚宽策略模块
 
     module: 含 `initialize` 的模块对象（策略文件 import 进来即可）
+
+    slippage / impact_model: 默认 1bp 固定滑点。**默认值原先是 0.0**，见
+        JQEngine 的说明。要评估容量用 impact_model="sqrt"。
+        策略内显式 `set_slippage()` 时以策略为准。
     """
     data = JQData(panel, start, end, etf_yield=etf_yield, verbose=verbose)
     eng = JQEngine(data, initial_cash, fill=fill, rules=rules, verbose=verbose,
-                   volume_limit=volume_limit)
+                   volume_limit=volume_limit, slippage=slippage,
+                   impact_model=impact_model, impact_k=impact_k)
     # 聚宽的 g 是平台注入到策略模块命名空间的全局对象。
     # 策略里写的是 `g.trading_signal = True`，所以必须把 g 绑到模块全局。
     module.g = eng.g

@@ -36,6 +36,9 @@ class UniverseSpec:
     amount_window: int = 20       # 计算日均成交额的窗口
     exclude_st: bool = True
     exclude_suspended: bool = True
+    # 剔除"涨跌停规则不可靠"的 (代码, 日期)，见 database/defects.py::C1。
+    # 默认 True：宁可少回测一段，也不拿不可靠的涨跌停价出结论。
+    exclude_unreliable: bool = True
     top_n: int = 0                # 按流动性取前 N（0=不限）
 
     def describe(self) -> str:
@@ -48,6 +51,8 @@ class UniverseSpec:
             parts.append("剔除ST")
         if self.exclude_suspended:
             parts.append("剔除停牌")
+        if self.exclude_unreliable:
+            parts.append("剔除涨跌停规则不可靠段")
         if self.top_n:
             parts.append(f"取流动性前{self.top_n}")
         return " / ".join(parts)
@@ -225,6 +230,16 @@ def build_universe(panel: dict, spec: UniverseSpec = None, **kw) -> pd.DataFrame
         mask &= ~st_panel(dates, codes)
     if spec.exclude_suspended:
         mask &= ~suspended_panel(dates, codes)
+
+    # 已知数据缺陷覆盖的 (代码, 日期) —— 默认**排除**
+    #
+    # 目前只有 C1（北交所前缀在 2021-11-15 之前）。为什么不只是把涨跌停价
+    # 置 NaN 就完事：NaN 在引擎里表示"没有涨跌幅限制"，那是**偏宽松**的 ——
+    # 会让这些股票随便成交。而真相是"我们不知道当时什么规则"。
+    # 把"不知道"当成"没限制"比数据缺失更危险，所以这里直接不让它们进池。
+    if spec.exclude_unreliable:
+        from database.defects import unreliable_limit_mask
+        mask &= ~unreliable_limit_mask(codes, dates)
 
     # 流动性前 N
     if spec.top_n:

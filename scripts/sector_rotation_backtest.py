@@ -124,9 +124,11 @@ def main():
     ap.add_argument("--commission", type=float, default=0.0001)
     ap.add_argument("--stamp-duty", type=float, default=0.0005)
     ap.add_argument("--min-commission", type=float, default=5.0)
-    ap.add_argument("--slippage", type=float, default=0.0,
-                    help="固定滑点；资金 ≤100 万时可置 0（冲击成本可忽略）")
-    ap.add_argument("--impact-model", default="none", choices=["none", "fixed", "sqrt"])
+    ap.add_argument("--slippage", type=float, default=0.001,
+                    help="固定滑点（默认 1bp）。原默认 0.0，"
+                         "配合 --impact-model none 等于零交易摩擦，结果偏乐观")
+    ap.add_argument("--impact-model", default="none", choices=["none", "fixed", "sqrt"],
+                    help="none 时用上面的固定滑点；sqrt 用于容量分析")
     ap.add_argument("--impact-k", type=float, default=0.1)
     # 股票池
     ap.add_argument("--universe-index", default="", help="股票池指数（空=全市场）")

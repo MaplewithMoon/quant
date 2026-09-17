@@ -56,6 +56,12 @@ def main():
                     help="货币 ETF（511880）合成年化收益；库里没有它的日线")
     ap.add_argument("--only", default="", help="只跑其中一个：v1 / v2")
     ap.add_argument("--no-rules", action="store_true", help="关闭 A 股制度约束（对照用）")
+    ap.add_argument("--slippage", type=float, default=0.001,
+                    help="固定滑点（默认 1bp）。⚠️ 原先引擎里硬编码 0.0，"
+                         "零滑点会让两个策略的结果偏乐观")
+    ap.add_argument("--impact-model", default="none", choices=["none", "fixed", "sqrt"],
+                    help="市场冲击模型；sqrt 需配合加大 --capital 做容量分析")
+    ap.add_argument("--impact-k", type=float, default=0.1, help="平方根冲击系数")
     ap.add_argument("--verbose", action="store_true", help="打印策略日志")
     ap.add_argument("--outdir", default="results/jq")
     args = ap.parse_args()
@@ -69,6 +75,8 @@ def main():
     banner("聚宽策略移植回测  |  与本项目引擎对照")
     print(f"  区间 {args.start} ~ {args.end}   本金 {args.capital:,.0f}   "
           f"成交价 {args.fill}   制度约束 {'关' if args.no_rules else '开'}")
+    print(f"  滑点 {args.slippage:.2%}   冲击模型 {args.impact_model}"
+          + (f"(k={args.impact_k})" if args.impact_model == "sqrt" else ""))
 
     banner("1. 加载数据", "-")
     t1 = time.time()
@@ -91,7 +99,9 @@ def main():
         res = run_strategy(mod, panel, args.start, args.end,
                            initial_cash=args.capital, fill=args.fill,
                            etf_yield=args.etf_yield, rules=not args.no_rules,
-                           verbose=args.verbose)
+                           verbose=args.verbose, slippage=args.slippage,
+                           impact_model=args.impact_model,
+                           impact_k=args.impact_k)
         eq = res["equity"]
         eng = res["engine"]
         print(f"  用时 {time.time()-t2:.0f}s   交易日 {len(eq)}   "

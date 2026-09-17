@@ -108,6 +108,13 @@ def assert_no_lookahead(decision_dates, used_data, raise_on_violation=True,
     若检测到任一决策使用了"决策日之后才可获得"的数据，则报错（默认）
     或告警（raise_on_violation=False）。
 
+    ⚠️ **`used_data` 必须是"每个决策各自实际使用的那一小片数据"，不能传全量面板。**
+    传全量面板时，对除最后一个决策日以外的每一天，面板里都必然存在
+    `_available > 决策日` 的行（因为面板覆盖到回测结束），于是会报出成千上万条
+    假违规 —— 这个检查就废了。要传全量面板请用 `verify_point_in_time` 的
+    逐决策配对形式，或直接用 `check_fill_timing` 做引擎层校验。
+    本函数会在检测到"像全量面板"时直接抛错，避免静默产生垃圾结论。
+
     参数:
         decision_dates:      决策日列表
         used_data:          {数据名: DataFrame}，须含 "_available" 列
@@ -118,6 +125,7 @@ def assert_no_lookahead(decision_dates, used_data, raise_on_violation=True,
     返回:
         违规数量（0 = 通过）
     """
+    _reject_full_panel(used_data, decision_dates)
     violations = check_lookahead(decision_dates, used_data,
                                  trade_same_day_ok=trade_same_day_ok)
     if violations:
@@ -132,6 +140,105 @@ def assert_no_lookahead(decision_dates, used_data, raise_on_violation=True,
         return len(violations)
     print("[未来因子检测] 通过：所有决策使用的数据在决策日之前均已可获得，无未来数据泄漏。")
     return 0
+
+
+def _reject_full_panel(used_data, decision_dates):
+    """拦住"把全量面板当 used_data 传"这个致命误用
+
+    判据：如果某个数据表里 `_available` 的最大值**远晚于**最后一个决策日，
+    说明它覆盖了决策之后的时间 —— 那不是"某次决策用到的数据"，而是整段面板。
+    此时 `check_lookahead` 会对几乎每个决策日都报违规，结论毫无意义。
+    与其静默给出垃圾，不如直接报错并告诉调用方该用什么。
+    """
+    ds = [pd.Timestamp(d) for d in decision_dates]
+    if not ds:
+        return
+    last = max(ds)
+    for name, df in (used_data or {}).items():
+        if df is None or getattr(df, "empty", True) or "_available" not in df.columns:
+            continue
+        avail = pd.to_datetime(df["_available"], errors="coerce").dropna()
+        if len(avail) and avail.max() > last + pd.Timedelta(days=30):
+            raise ValueError(
+                f"used_data['{name}'] 看起来是**全量面板**（可获得日到 "
+                f"{avail.max().date()}，而最后一个决策日是 {last.date()}）。"
+                f"`check_lookahead` 只接受「每个决策各自实际使用的那一小片数据」；"
+                f"传全量面板会对除最后一天外的每个决策日都报假违规。"
+                f"要在回测后做引擎层校验请用 `check_fill_timing`，"
+                f"要逐决策校验请用 `verify_point_in_time`。"
+            )
+
+
+# ============================================================
+# 引擎层校验：成交时点不得早于决策时点
+# ============================================================
+def check_fill_timing(rebalance_dates, trades, fill_timing="next_open",
+                      trade_date_col="timestamp"):
+    """校验"成交不早于决策"，并识别同日成交的前视风险
+
+    这是**引擎能自己保证**的那部分 PIT —— 不需要知道策略用了哪些数据，
+    只需要知道"哪一天做的决策"和"成交发生在哪一天"。
+
+    规则：
+      - `next_open`（本项目默认）：T 日收盘后算权重、**T+1 开盘成交**。
+        因此任何一笔成交都**不得**发生在它的决策日当天或之前。
+        违反 = 用了当天收盘信息在当天成交，典型前视。
+      - `same_close`：决策与成交同日、同用收盘价。**这是温和的前视**
+        （收盘价要收盘后才知道，却按该价成交）。不是错误，但必须显式声明，
+        这里作为"声明项"返回而不是静默放过。
+
+    参数:
+        rebalance_dates: 产生目标权重的决策日（升序）
+        trades:          成交明细 DataFrame，含 trade_date_col
+        fill_timing:     "next_open" / "same_close"
+
+    返回:
+        dict(report=str, violations=list, same_day_fills=int, checked=int)
+    """
+    reb = sorted(pd.Timestamp(d) for d in rebalance_dates)
+    lines, violations = [], []
+    same_day = 0
+    checked = 0
+    if trades is None or getattr(trades, "empty", True) or not reb:
+        return {"report": "  成交时点校验: 无成交或无调仓，跳过",
+                "violations": [], "same_day_fills": 0, "checked": 0}
+
+    t = trades
+    if trade_date_col not in t.columns:
+        t = t.reset_index()
+        if trade_date_col not in t.columns:
+            trade_date_col = t.columns[0]
+    dates = pd.to_datetime(t[trade_date_col], errors="coerce")
+
+    for d in dates:
+        if pd.isna(d):
+            continue
+        checked += 1
+        # 该笔成交对应的最近一次决策（不晚于它的最后一次调仓）
+        prior = [r for r in reb if r <= d]
+        if not prior:
+            violations.append((d, None, "成交早于任何一次调仓决策"))
+            continue
+        r = prior[-1]
+        if d == r:
+            same_day += 1
+            if fill_timing != "same_close":
+                violations.append((d, r, f"{fill_timing} 模式下不得在决策日当天成交"))
+    if same_day and fill_timing == "same_close":
+        lines.append(f"  ⚠ 同日成交 {same_day}/{checked} 笔（fill=same_close）："
+                     f"这是**温和前视** —— 用当日收盘价决策并按同一价格成交。"
+                     f"做敏感性请加 --fill open 对比")
+    if violations:
+        lines.append(f"  ✗ 成交时点违规 {len(violations)} 笔（前 5 条）：")
+        for d, r, why in violations[:5]:
+            lines.append(f"      成交日 {d.date()}  决策日 "
+                         f"{r.date() if r is not None else '—'}  {why}")
+    else:
+        lines.append(f"  ✓ 成交时点校验通过：{checked} 笔成交均不早于其决策日"
+                     f"（fill={fill_timing}）")
+    return {"report": "\n".join(lines), "violations": violations,
+            "same_day_fills": same_day, "checked": checked}
+
 
 
 # ============================================================
