@@ -69,6 +69,11 @@ class MultiBacktestResult:
     context: dict = field(default_factory=dict)   # 回测输入（区间/指数/交易所…）
     fill_timing: str = ""
     gate: dict = field(default_factory=dict)      # 因子门禁结果（T1·③ 填）
+    # ---- C5 埋点（T1·①）----
+    # 「封板判完全不可成交」这个假设影响多大？只埋点、不改撮合逻辑，
+    # 用数据决定要不要建排队模型。
+    rejection_detail: list = field(default_factory=list)
+    attempted_turnover: float = 0.0               # 想成交的总金额（分母）
 
     def render(self, title: str = None, **kw) -> str:
         """统一报告（渲染逻辑集中在 analytics/result_report.py）"""
@@ -170,6 +175,8 @@ class PortfolioBacktestEngine:
         pf = Portfolio(self.initial_capital)
         equity, trades, holds = [], [], []
         rejects: Dict[str, int] = {}
+        reject_log: list = []      # C5 埋点：被拦委托的明细
+        attempted = 0.0            # 累计"想成交"的金额（分母）
         pending = None      # (调仓日, 目标权重) —— next_open 模式下待执行
         rebalance_dates = []          # 决策日（供前视自检）
         risk_events = []              # 风控触发记录
@@ -181,7 +188,8 @@ class PortfolioBacktestEngine:
             if pending is not None:
                 tdate, tw_row = pending
                 ref = self._ref_prices(opn, d)
-                self._rebalance(pf, tw_row, ref, d, panel, trades, rejects)
+                attempted += self._rebalance(pf, tw_row, ref, d, panel,
+                                             trades, rejects, reject_log)
                 pending = None
 
             # 2) 今日若是调仓日，产生目标权重
@@ -196,7 +204,8 @@ class PortfolioBacktestEngine:
                     risk_events.extend(ev)
                 if self.fill_timing == FILL_SAME_CLOSE:
                     ref = self._ref_prices(close, d)
-                    self._rebalance(pf, row, ref, d, panel, trades, rejects)
+                    attempted += self._rebalance(pf, row, ref, d, panel,
+                                                 trades, rejects, reject_log)
                 else:
                     pending = (d, row)
 
@@ -252,7 +261,9 @@ class PortfolioBacktestEngine:
                                    same_day_fills=same_day,
                                    risk_events=risk_events,
                                    defects=matched, context=ctx,
-                                   fill_timing=self.fill_timing)
+                                   fill_timing=self.fill_timing,
+                                   rejection_detail=reject_log,
+                                   attempted_turnover=float(attempted))
 
     # ---------- 内部 ----------
     @staticmethod
@@ -300,11 +311,13 @@ class PortfolioBacktestEngine:
 
     def _rebalance(self, pf: Portfolio, target_w: pd.Series,
                    ref: Dict[str, float], d, panel: dict,
-                   trades: list, rejects: Dict[str, int]):
+                   trades: list, rejects: Dict[str, int],
+                   reject_log: list = None):
         """把当前持仓调整到目标权重：先卖后买"""
         total = pf.total_value
         if total <= 0:
-            return
+            return 0.0
+        attempted = 0.0            # 本次调仓"想成交"的金额（C5 分母）
         symbols = sorted(set(target_w.dropna().index) | set(pf.positions))
         tw = target_w.reindex(symbols).fillna(0.0)
 
@@ -327,15 +340,19 @@ class PortfolioBacktestEngine:
             if tgt >= cur:
                 continue
             qty = cur - tgt
+            attempted += qty * (ref.get(c) or 0.0)
             if self.market_rules.enabled and self.market_rules.t_plus > 0:
                 qty = min(qty, pf.sellable_size(c))
             if qty <= 0:
-                self._reject(rejects, "T+1 当日买入不可卖")
+                self._reject(rejects, "T+1 当日买入不可卖", reject_log,
+                             d=d, code=c, side="sell",
+                             qty=qty, px=ref.get(c), panel=panel)
                 continue
             px = ref[c]
             ok, why = self.market_rules.check_sell(self._bar(panel, d, c), px)
             if not ok:
-                self._reject(rejects, why)
+                self._reject(rejects, why, reject_log, d=d, code=c,
+                             side="sell", qty=qty, px=px, panel=panel)
                 continue
             vol = self._volume(panel, d, c)
             qty = min(qty, self.broker.max_tradable_size(vol, is_buy=False))
@@ -362,10 +379,12 @@ class PortfolioBacktestEngine:
             px = ref[c]
             ok, why = self.market_rules.check_buy(self._bar(panel, d, c), px)
             if not ok:
-                self._reject(rejects, why)
+                self._reject(rejects, why, reject_log, d=d, code=c,
+                             side="buy", qty=(tgt - cur), px=px, panel=panel)
                 continue
             vol = self._volume(panel, d, c)
             qty = tgt - cur
+            attempted += qty * px            # C5 分母：买入侧"想成交"金额
             qty = min(qty, self.broker.max_tradable_size(vol, is_buy=True))
             if qty <= 0:
                 continue
@@ -398,8 +417,50 @@ class PortfolioBacktestEngine:
                     continue
                 trades.append(self._rec(d, c, "buy", qty, ep, fees, 0.0, total))
 
+        return attempted
+
+    def _reject(self, rejects: Dict[str, int], why: str, reject_log=None,
+                d=None, code=None, side=None, qty=None, px=None, panel=None):
+        """记录一次"完全不可成交"（T1·① 埋点）
+
+        ⚠️ **只埋点，不改撮合逻辑** —— 封板仍然判完全不可成交。这里额外记下
+        金额、方向、是不是一字板，用来回答"这个假设影响多大"。若被拦金额占比
+        很小（<1%），C5 降级为报告里的一句声明，后面的排队建模就不用做了。
+
+        一字板判据：open==high==low==close==板价（全天无打开）。
+        非一字（盘中打开过、有真实成交量）才是"排队可能成交一部分"的情形。
+        """
+        self._reject_count(rejects, why)
+        if reject_log is None:
+            return
+        amt = None
+        try:
+            if qty and px:
+                amt = float(qty) * float(px)
+        except (TypeError, ValueError):
+            amt = None
+        rec = {"date": d, "code": code, "side": side, "reason": why,
+               "amount": amt, "one_word": None}
+        if panel is not None and d is not None and code is not None:
+            try:
+                o = float(panel["open"].at[d, code])
+                h = float(panel["high"].at[d, code])
+                lo = float(panel["low"].at[d, code])
+                cl = float(panel["close"].at[d, code])
+                lu = panel.get("limit_up")
+                ld = panel.get("limit_down")
+                lu = float(lu.at[d, code]) if lu is not None else float("nan")
+                ld = float(ld.at[d, code]) if ld is not None else float("nan")
+                flat = (o == h == lo == cl)
+                at_limit = ((np.isfinite(lu) and cl == lu)
+                            or (np.isfinite(ld) and cl == ld))
+                rec["one_word"] = bool(flat and at_limit)
+            except (KeyError, TypeError, ValueError):
+                rec["one_word"] = None
+        reject_log.append(rec)
+
     @staticmethod
-    def _reject(rejects: Dict[str, int], why: str):
+    def _reject_count(rejects: Dict[str, int], why: str):
         key = why.split("(")[0].strip()
         rejects[key] = rejects.get(key, 0) + 1
 

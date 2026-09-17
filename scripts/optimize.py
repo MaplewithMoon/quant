@@ -184,13 +184,9 @@ def main():
 
     # 执行/成本（与 backtest 保持一致）
     p.add_argument("--capital", type=float, default=1_000_000)
-    p.add_argument("--commission", type=float, default=0.0001)
-    p.add_argument("--min-commission", type=float, default=5.0)
-    p.add_argument("--stamp-duty", type=float, default=0.0005)
-    p.add_argument("--transfer-fee", type=float, default=0.00001)
-    p.add_argument("--slippage", type=float, default=0.001)
-    p.add_argument("--fill-timing", default=FILL_NEXT_OPEN,
-                   choices=[FILL_NEXT_OPEN, FILL_SAME_CLOSE])
+    # 执行参数由公共层统一提供（原先各脚本各写一遍，见 execution/setup.py）
+    from execution.setup import add_execution_args
+    add_execution_args(p, fill_default=FILL_NEXT_OPEN)
     p.add_argument("--no-rules", action="store_true", help="关闭 A股制度约束")
     p.add_argument("--out", default="", help="把结果保存为 CSV")
 
@@ -213,16 +209,15 @@ def main():
     if not space:
         raise SystemExit("参数空间为空")
 
+    # 执行参数（成交时点/滑点/冲击模型/费用）统一从公共层取；
+    # transfer_fee 与 truncate_data 是单标的引擎特有的，单独补
+    from execution.setup import build_execution
     bt_kwargs = dict(
         initial_capital=args.capital,
-        commission=args.commission,
-        min_commission=args.min_commission,
-        stamp_duty=args.stamp_duty,
         transfer_fee=args.transfer_fee,
-        slippage=args.slippage,
-        fill_timing=args.fill_timing,
         market_rules=MarketRules(enabled=not args.no_rules),
         truncate_data=True,
+        **build_execution(args),
     )
 
     symbols = (parse_symbols(args.symbols) if args.symbols

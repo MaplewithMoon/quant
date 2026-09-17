@@ -149,11 +149,17 @@ def render_risk(res) -> List[str]:
 def render_rejections(res) -> List[str]:
     """被制度约束拦下的委托 —— 也是 C5（排队/部分成交）的**度量入口**
 
-    这里汇总的"被拦"量级，就是决定要不要建排队模型的依据：
-    占比很小（<1%）时，声明即可；很大（>5%）才值得投入。
+    这里回答的是：「封板判完全不可成交」这个假设**影响多大**。
+    度量结论决定要不要建排队模型：
+
+        < 1%  -> 声明即可，不用建模（C5 到此为止）
+        1~5%  -> 报告里注明方向（偏悲观），暂不建模
+        > 5%  -> 值得建"非一字封板按比例成交"的近似（日线天花板就在那）
     """
     rej = getattr(res, "rejections", None) or {}
-    if not rej:
+    detail = getattr(res, "rejection_detail", None) or []
+    attempted = getattr(res, "attempted_turnover", 0.0) or 0.0
+    if not rej and not detail:
         return []
     L = _sec("五、被制度约束拦下的委托（涨跌停/停牌/整手…）")
     total = sum(rej.values())
@@ -161,8 +167,38 @@ def render_rejections(res) -> List[str]:
         L.append(f"  {v:>7,} 次  ({v / max(1, total):>5.1%})  {k}")
     if len(rej) > 15:
         L.append(f"  ... 另有 {len(rej) - 15} 类")
-    L.append(f"  —— 合计 {total:,} 次。这是「完全不可成交」假设拦下的量；")
-    L.append("     真实世界排队可能成交一部分，故主结果是**下界**（见 T1·C5）。")
+    L.append(f"  —— 合计 {total:,} 次")
+
+    # ---- C5 度量：被拦金额占比 ----
+    if detail:
+        amts = [r.get("amount") for r in detail if r.get("amount")]
+        blocked = float(sum(amts)) if amts else 0.0
+        ow = [r for r in detail if r.get("one_word") is True]
+        n_ow = len(ow)
+        ratio = (blocked / attempted) if attempted > 0 else float("nan")
+        L.append("")
+        L.append("  --- C5 度量：假设「封板完全不可成交」的影响有多大 ---")
+        L.append(f"  被拦 {len(detail):,} 笔，金额 {blocked:,.0f} 元；"
+                 f"同期想成交总额 {attempted:,.0f} 元")
+        if ratio == ratio:      # not NaN
+            L.append(f"  **被拦金额占比 {ratio:.2%}**"
+                     f"（一字板 {n_ow:,} 笔占 {n_ow / max(1, len(detail)):.0%}）")
+            if ratio < 0.01:
+                L.append("  判读：占比 <1% —— 该假设**不构成主要不确定性**，"
+                         "报告声明即可，无需建排队模型")
+            elif ratio < 0.05:
+                L.append("  判读：占比 1%~5% —— 方向已知（**偏悲观**），"
+                         "报告注明即可；暂不值得建模")
+            else:
+                L.append("  判读：占比 >5% —— 值得考虑「非一字封板按比例成交」"
+                         "的近似（日线天花板就在那；再往上需要分钟数据）")
+        # 一字板 vs 非一字：只有非一字才可能排队成交一部分
+        L.append(f"  其中一字板 {n_ow:,} 笔（open==high==low==close==板价，"
+                 f"全天无打开 -> 维持不可成交是对的）")
+        L.append(f"       非一字 {len(detail) - n_ow:,} 笔"
+                 f"（盘中打开过、有真实成交量 -> 排队**可能**成交一部分）")
+    L.append("")
+    L.append("  主结果基于「完全不可成交」，故是收益**下界**（见 T1·C5）。")
     return L
 
 

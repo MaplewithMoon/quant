@@ -147,6 +147,11 @@ def main():
                     help="fundamental_ic.py 产出的因子统计表（用于预注册规则选因子）")
     ap.add_argument("--cache-dir", default=".cache/panel")
     ap.add_argument("--lag-days", type=int, default=1)
+    ap.add_argument("--horizon", type=int, default=20,
+                    help="因子门禁用的前瞻收益窗口（交易日）")
+    ap.add_argument("--no-gate", action="store_true",
+                    help="跳过因子有效性门禁。⚠️ 跳过时报告头部会显式标注"
+                         "「未执行门禁」，不允许静默略过")
     ap.add_argument("--outdir", default="results/multifactor")
     args = ap.parse_args()
 
@@ -259,6 +264,31 @@ def main():
           + (f"   因子收益 {_factor_rets.shape[0]} 日"
              if _factor_rets is not None else ""))
 
+    # ---- 因子有效性门禁（T1·③）----
+    # 已有的选因子规则（combine_by_rule）三个条件**全是样本内**，样本外没有任何
+    # 自动检查 —— A8 说的正是这种："样本外 IC 显著但多空为负、单调性≈0"。
+    # ⚠️ 门禁**只标记不剔除**：静默剔除会造出"被审查过的幸存者因子库"，
+    #    与股票池的幸存者偏差是同构的病。
+    _gate = {}
+    if args.no_gate:
+        print("  ⚠ 因子门禁: **未执行**（--no-gate）—— 结果未经样本外有效性检查")
+    else:
+        from factors.gate import gate_check, gate_summary
+        from factors.panel import forward_returns
+        _fwd = forward_returns(adjusted_close(panel), periods=args.horizon)
+        _reps, _scored = [], {}
+        for _name, _f in factors.items():
+            if _f is None or _f.empty:
+                continue
+            _r = gate_check(_f, _fwd, split_point=args.split, label=_name)
+            _reps.append(_r)
+            _scored[_name] = _r
+        _gate = gate_summary(_reps)
+        if _gate:
+            print(f"  因子门禁: {_gate['status']} — {_gate['summary']}")
+            for _x in _gate["reasons"][:5]:
+                print(f"      ✗ {_x}")
+
     # ---------- 2. 预注册规则挑因子 ----------
     banner("2. 因子集合（预注册规则 + 先验组合）", "-")
     rule_factors, prior_factors = [], ["bp", "ep_ttm", "turnover_20", "holder_chg"]
@@ -276,6 +306,14 @@ def main():
     if rule_factors:
         sets.append(("规则组合", [f for f in rule_factors if f in factors]))
     sets.append(("先验组合", [f for f in prior_factors if f in factors]))
+
+    # 门禁结果**只标记不剔除**：静默剔除会造出"被审查过的幸存者因子库"，
+    # 与股票池的幸存者偏差是同构的病。
+    for _lab, _names in sets:
+        _bad = [_n for _n in _names
+                if _scored.get(_n, {}).get("status") in ("FAIL", "WARN")]
+        if _bad:
+            print(f"  ⚠ {_lab} 含未通过门禁的因子（**保留，仅标记**）: {_bad}")
 
     # ---------- 3. 训练集选持股数，测试集只跑一次 ----------
     banner("3. 训练集选参数 -> 测试集验证", "-")
@@ -339,6 +377,10 @@ def main():
         })
         results[label] = {"train": tr, "test": te, "full": full,
                           "names": names, "n_hold": n_best, "score": score}
+
+    # 把门禁结果挂到**回测结果对象**上，报告头部会显示（⑤ 的载体直接生效）
+    for _r in results.values():
+        _r["full"]["result"].gate = _gate
 
     cmp = pd.DataFrame(rows)
     cmp.to_csv(os.path.join(args.outdir, "compare.csv"), index=False,

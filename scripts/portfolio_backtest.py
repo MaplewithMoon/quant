@@ -79,17 +79,15 @@ def main():
     ap.add_argument("--top-n", type=int, default=0, help="股票池按流动性取前 N")
     ap.add_argument("--no-st-filter", action="store_true", help="不剔除 ST")
     ap.add_argument("--capital", type=float, default=1_000_000)
-    ap.add_argument("--commission", type=float, default=0.0001)
-    ap.add_argument("--stamp-duty", type=float, default=0.0005)
-    ap.add_argument("--slippage", type=float, default=0.001)
-    ap.add_argument("--impact-model", default="fixed", choices=["fixed", "sqrt", "none"])
-    ap.add_argument("--impact-k", type=float, default=0.1)
-    ap.add_argument("--max-participation", type=float, default=0.10)
-    ap.add_argument("--fill-timing", default=FILL_NEXT_OPEN,
-                    choices=[FILL_NEXT_OPEN, FILL_SAME_CLOSE])
+    # 执行参数（成交时点/滑点/冲击模型/全部费用/参与率）由公共层统一提供
+    from execution.setup import add_execution_args
+    add_execution_args(ap, fill_default=FILL_NEXT_OPEN)
     ap.add_argument("--no-rules", action="store_true", help="关闭 A股制度约束")
-    ap.add_argument("--max-weight", type=float, default=0.0,
-                    help="单票权重上限，如 0.05（0=不启用）")
+    # ⚠️ 这里**不要**再定义 --max-weight：第 75 行已有同名参数（用于组合构建时的
+    # 单票上限），重复定义会让 argparse 直接抛
+    # `ArgumentError: argument --max-weight: conflicting option string`
+    # —— 实测本脚本的 --help 因此从 T0 那一版起就一直是坏的，直到加了
+    # tests/test_cli.py 才被发现。风控直接复用同一个 --max-weight。
     ap.add_argument("--max-drawdown", type=float, default=0.0,
                     help="回撤降仓阈值，如 0.20（0=不启用）")
     ap.add_argument("--derisk-min-exposure", type=float, default=0.0,
@@ -148,12 +146,10 @@ def main():
           f"{turnover_of_weights(tw).mean():.1%}" if len(reb_days) > 1 else "调仓次数不足")
 
     # ---- 5. 回测 ----
+    # 执行参数统一从公共层取（成交时点/滑点/冲击模型/费用/参与率）
+    from execution.setup import build_execution
     eng = PortfolioBacktestEngine(
-        initial_capital=args.capital, commission=args.commission,
-        stamp_duty=args.stamp_duty, slippage=args.slippage,
-        slippage_model=build_model(args.impact_model, rate=args.slippage, k=args.impact_k),
-        max_participation=args.max_participation,
-        fill_timing=args.fill_timing,
+        initial_capital=args.capital, **build_execution(args),
         market_rules=MarketRules(enabled=not args.no_rules))
     # 组合层风控（默认全关 = 保持原行为）
     from risk import build_risk_manager

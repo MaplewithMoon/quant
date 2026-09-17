@@ -121,15 +121,10 @@ def main():
     ap.add_argument("--benchmark", default=BENCH_CODE)
     # 资金与费用
     ap.add_argument("--capital", type=float, default=1_000_000)
-    ap.add_argument("--commission", type=float, default=0.0001)
-    ap.add_argument("--stamp-duty", type=float, default=0.0005)
-    ap.add_argument("--min-commission", type=float, default=5.0)
-    ap.add_argument("--slippage", type=float, default=0.001,
-                    help="固定滑点（默认 1bp）。原默认 0.0，"
-                         "配合 --impact-model none 等于零交易摩擦，结果偏乐观")
-    ap.add_argument("--impact-model", default="none", choices=["none", "fixed", "sqrt"],
-                    help="none 时用上面的固定滑点；sqrt 用于容量分析")
-    ap.add_argument("--impact-k", type=float, default=0.1)
+    # 执行参数（成交时点 / 滑点 / 冲击模型 / 全部费用）由公共层统一提供 ——
+    # 原先各脚本各写一遍，这个脚本连 --fill-timing 都没有（见 execution/setup.py）
+    from execution.setup import add_execution_args
+    add_execution_args(ap, fill_default="next_open")
     # 股票池
     ap.add_argument("--universe-index", default="", help="股票池指数（空=全市场）")
     ap.add_argument("--min-listed-days", type=int, default=120)
@@ -191,22 +186,14 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     zh = setup_font()
 
-    engine_kwargs = dict(
-        initial_capital=args.capital,
-        commission=args.commission, min_commission=args.min_commission,
-        stamp_duty=args.stamp_duty, slippage=args.slippage,
-    )
-    if args.impact_model != "none":
-        from execution.impact import build_model
-        engine_kwargs["slippage_model"] = build_model(
-            args.impact_model, k=args.impact_k)
+    from execution.setup import build_execution, describe_execution
+    engine_kwargs = dict(initial_capital=args.capital, **build_execution(args))
 
     banner("板块动量轮动策略  |  完整回测 + 样本外验证")
     print(f"  区间        : {split.describe()}")
     print(f"  预热起点    : {warmup_start}（只用于算动量，不计入绩效）")
     print(f"  基准        : {args.benchmark} {BENCH_NAME}")
-    print(f"  初始资金    : {args.capital:,.0f}    滑点 {args.slippage:.2%}   "
-          f"冲击模型 {args.impact_model}")
+    print(f"  初始资金    : {args.capital:,.0f}    {describe_execution(engine_kwargs)}")
     print(f"  调仓频率    : {args.rebalance}")
 
     # ---------- 1. 数据 ----------
