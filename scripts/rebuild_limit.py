@@ -94,9 +94,12 @@ def rebuild():
 
         # 交易所口径：涨跌停价按昨收（除权后参考价）× (1 ± 幅度)，四舍五入到分。
         # 规则（含 ST 5%、北交所 30%、创业板 2020-08-24 前 10%、上市初期特殊
-        # 规则）统一在 database/limit_rules.py，这里不再自己实现一遍。
+        # 规则、复牌首日不设限）统一在 database/limit_rules.py，这里不再自己实现。
+        # `resume_no_limit=True`：这里的 d 是**该股完整连续日线**，
+        # 复牌判定靠"错过几个交易日"，只有完整序列才能算对。
         out = apply_limit_prices(d, code, st_map,
-                                 listing_rule=windows.get(code))
+                                 listing_rule=windows.get(code),
+                                 resume_no_limit=True)
         n_nolimit += int(out["limit_up"].isna().sum())
         out = out[["code", "trade_date", "pre_close", "limit_up", "limit_down"]]
 

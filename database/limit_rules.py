@@ -368,11 +368,75 @@ def st_mask(dates, code: str,
 # ============================================================
 # DataFrame 入口
 # ============================================================
+# ============================================================
+# 复牌首日不设涨跌幅（C4b 的**真实**机制）
+# ============================================================
+# 文档里 C4b 写成「2006–2007 未股改 S 股无涨跌幅限制」。**用行情数据反证后，
+# 这个说法是错的**：
+#
+#   纯 S 股 2006-2007 的日线 68,552 行，|涨跌幅| > 10.5% 的只有 97 行（0.14%），
+#   而同期全市场是 960 / 611,411 = 0.157% —— **两者几乎一样**。
+#   也就是说纯 S 股照样受 ±10% 约束，"整个 S 期间无限制"不成立。
+#
+# 真正的机制是**停牌复牌首日不设涨跌幅**：
+#
+#   2006-2007 全部 960 行越界里，能判定"距上一根 K 线间隔"的有 771 行，
+#   其中 **770 行（99.87%）是复牌首日**（|涨跌幅| > 20% 的 444 行**全部**是）。
+#   六个案例逐个查过：`S石炼化`→`长江证券`(+310%)、`S京化二`→`国元证券`(+256%)、
+#   `S锦六陆`→`东北证券`(+216%)、`S开开`(+238%)、`S华源发`(+198%)、`S天宇`(+191%)
+#   —— 都是停牌数月后**复牌当日改名**，`pre_close` 还是停牌前最后收盘价，
+#   **次日立刻恢复 ±10%**（如 600272 次日 −10.00%）。
+#
+# 阈值用「**错过的交易日数**」（市场开市而该股无 K 线），而不是自然日 ——
+# 后者会把春节/国庆长假算成停牌。实测（2006-2007）：
+#
+#   错过交易日   行数       越界行    越界率
+#        0     601,086        1      0.00%
+#      1-5      7,750         0      0.00%     <- 有限制（含停牌一天开会）
+#     6-10        750        26      3.47%     <- 混合带
+#    11-20        987       480     48.63%     <- 明确无限制
+#    > 20         647       264     ~40%
+#
+# ⚠️ 边界是**经验性**的、不是查到的交易所条文。取 6（混合带起点）偏宽松、
+# 取 11 偏保守。默认取 11（只在证据最硬的区间生效），可用
+# `RESUME_NO_LIMIT_MIN_MISSED` 调整；`database/defects.py` 的 C4b 记录了
+# 这条不确定性。
+RESUME_NO_LIMIT_MIN_MISSED = 11
+
+
+def resumption_windows(df: pd.DataFrame, code: str = None,
+                       min_missed: int = RESUME_NO_LIMIT_MIN_MISSED,
+                       date_col: str = "trade_date",
+                       cal: pd.DatetimeIndex = None) -> np.ndarray:
+    """标出「长期停牌后复牌首日」——这些日子不设涨跌幅
+
+    定义：该股某一根 K 线与上一根之间，**市场开市而它没有 K 线**的交易日数
+    ≥ `min_missed`，则这一根是复牌首日。
+
+    用交易日而不是自然日：长假造成的间隔不是停牌（市场也没开）。
+    """
+    n = len(df)
+    out = np.zeros(n, dtype=bool)
+    if n < 2:
+        return out
+    cal = cal if cal is not None else trading_calendar()
+    if len(cal) == 0:
+        return out
+    d = np.asarray(pd.to_datetime(df[date_col]).values, dtype="datetime64[ns]")
+    cal_v = cal.values.astype("datetime64[ns]")
+    lo = np.searchsorted(cal_v, d, "left")       # 该 K 线在日历上的位置
+    # 相邻两根之间的"市场开了但该股没有"的交易日数
+    missed = lo[1:] - lo[:-1] - 1
+    out[1:] = missed >= int(min_missed)
+    return out
+
+
 def apply_limit_prices(df: pd.DataFrame, code: str,
                        st_map: Dict[str, List[Tuple]] = None,
                        pre_close_col: str = "pre_close",
                        tick: float = TICK,
-                       listing_rule: Tuple = None) -> pd.DataFrame:
+                       listing_rule: Tuple = None,
+                       resume_no_limit: bool = False) -> pd.DataFrame:
     """给带官方 `pre_close` 的日线表加上 `limit_up` / `limit_down`
 
     ⚠️ 必须传**官方 pre_close**（tushare 已按除权调整），
@@ -381,6 +445,15 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
     listing_rule: 上市初期特殊规则 `(kind, until, n)`，来自
                   `listing_windows().get(code)`。不传 = 不做上市初期处理
                   （回测区间不覆盖次新股时结果一样，但校验会报不一致）。
+    resume_no_limit:
+                  **是否启用「复牌首日不设涨跌幅」**，默认 False。
+                  ⚠️ 只有在 `df` 是**该股票的完整连续日线序列**时才该打开。
+                  它靠"相邻两根 K 线之间错过了几个交易日"来判定停牌，
+                  所以传入**日期子集**（比如只取月度调仓日、或测试里的抽样日期）
+                  会把每个采样点都误判成复牌首日 —— 这个坑在实现时真的踩到了：
+                  `test_limit_rules` 用 3 个相隔数月的日期，结果全被判成复牌。
+                  全量重建涨跌停价的路径（`rebuild_limit.py`、
+                  `daily_update.rebuild_limit_year`）拿的是完整日线，已显式打开。
     """
     out = df.copy()
     if pre_close_col not in out.columns:
@@ -443,4 +516,11 @@ def apply_limit_prices(df: pd.DataFrame, code: str,
     out["limit_up"] = np.round(up, 10)
     out["limit_down"] = np.round(dn, 10)
     out.loc[bad, ["limit_up", "limit_down"]] = np.nan
+
+    # 复牌首日不设涨跌幅（C4b 的真实机制，见上方 RESUME_NO_LIMIT_MIN_MISSED）
+    if resume_no_limit:
+        rw = resumption_windows(out, code, date_col="trade_date")
+        if rw.any():
+            out.loc[rw, ["limit_up", "limit_down"]] = np.nan
+        out["is_resumption"] = rw
     return out

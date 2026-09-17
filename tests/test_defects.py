@@ -108,23 +108,28 @@ def test_defects_registry_shape():
 
 
 def test_defects_in_window_uses_intersection():
-    """窗口判定用**交集**：宁可多标注，不可漏标注"""
+    """窗口判定用**交集**：宁可多标注，不可漏标注
+
+    ⚠️ 用 B9（指数成分覆盖，有明确结束日 2016-05-31）来测边界。
+    不要用 C4b —— 它描述的是「复牌首日不设涨跌幅」，全历史都可能发生，
+    已改成无上界区间（`date_range=(1990-01-01, None)`），任何窗口都会命中。
+    """
     from database.defects import defects_in_window
 
-    # 完全覆盖 C4b（2006-2007）
-    keys = {d.key for d in defects_in_window("2006-01-01", "2007-12-31")}
-    assert "C4b" in keys, f"2006-2007 窗口应命中 C4b，实得 {keys}"
+    # 完全覆盖 B9（区间止于 2016-05-31）
+    keys = {d.key for d in defects_in_window("2006-01-01", "2015-12-31")}
+    assert "B9" in keys, f"2015 年前的窗口应命中 B9，实得 {keys}"
 
     # 只沾到边界一天也要算
-    keys = {d.key for d in defects_in_window("2007-12-31", "2020-01-01")}
-    assert "C4b" in keys, "窗口与缺陷区间只交叠一天也应命中"
+    keys = {d.key for d in defects_in_window("2016-05-31", "2020-01-01")}
+    assert "B9" in keys, "窗口与缺陷区间只交叠一天也应命中"
 
     # 完全不相交则不命中
-    keys = {d.key for d in defects_in_window("2015-01-01", "2020-01-01")}
-    assert "C4b" not in keys, f"2015-2020 不该命中 C4b，实得 {keys}"
+    keys = {d.key for d in defects_in_window("2018-01-01", "2020-01-01")}
+    assert "B9" not in keys, f"2018-2020 不该命中 B9，实得 {keys}"
 
     # 无日期区间的缺陷（B7 等）任何窗口都要标注
-    assert "B7" in {d.key for d in defects_in_window("2015-01-01", "2020-01-01")}
+    assert "B7" in {d.key for d in defects_in_window("2018-01-01", "2020-01-01")}
     print("[OK] 窗口判定：交集命中 / 边界日命中 / 不相交不命中 / 无区间恒标注")
 
 

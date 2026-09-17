@@ -404,8 +404,11 @@ def rebuild_limit_year(year):
             print(f"  [跳过] {code}: 清洗层缺 pre_close，无法正确计算涨跌停")
             continue
         df = df.sort_values("trade_date")
+        # resume_no_limit=True：清理层是该股的完整日线序列，
+        # 「复牌首日不设涨跌幅」的判定（靠"错过几个交易日"）才成立。
         out = apply_limit_prices(df, code, st_map,
-                                 listing_rule=windows.get(code))
+                                 listing_rule=windows.get(code),
+                                 resume_no_limit=True)
         # **不要 dropna**：limit 为空可能是"不设涨跌幅"（新股上市初期）或
         # pre_close 缺失，两种都要保留成空值行 —— 空值在引擎里表示"没有涨跌停
         # 限制"（`_num()` 返回 None 会跳过检查），删掉行会造成增量与全量重建

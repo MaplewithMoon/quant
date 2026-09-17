@@ -71,6 +71,19 @@ class SuspendDownloader(BaseDownloader):
         for c in ["suspend_date", "resume_date"]:
             if c in df.columns:
                 df[c] = pd.to_datetime(df[c])
+        # ⚠️ `suspend_timing` 必须**统一成 VARCHAR**再落盘。
+        # 若某只股票的全部记录都是空值，pyarrow 会把该列推断成 **NULL 类型**；
+        # 而另一只股票有值时又是 VARCHAR。两者混在一个目录里，
+        # `read_parquet('year=2005/*.parquet')` 会按**第一个文件的 schema** 去读，
+        # 于是抛 `ConversionException: failed to cast column suspend_timing
+        # from VARCHAR to NULL`。已经有 4,417 个文件处于混合状态。
+        # 读侧用 `union_by_name=true` 兜底（见 database/status.py），
+        # 这里从写入端保证不再产生新的不一致。
+        if "suspend_timing" in df.columns:
+            df["suspend_timing"] = (df["suspend_timing"]
+                                    .astype("string").fillna("").astype(object))
+        else:
+            df["suspend_timing"] = ""
         self.save_year(df, year=2005, code=code, force=True)
         self.storage.mark_done(code)
         return df
