@@ -310,8 +310,8 @@ def main():
     if not token:
         print("错误: 未找到 Tushare token")
         return
-    ts.set_token(token)
-    pro = ts.pro_api()
+    # 不要用 ts.set_token()：它会往家目录写 tk.csv，受限环境 PermissionError
+    pro = ts.pro_api(token)
 
     # 只补期权合约列表：不碰日线、不碰断点（8 次调用，秒级完成）
     if args.only == "opt_basic":

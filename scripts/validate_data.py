@@ -1194,6 +1194,79 @@ def _dedupe_file(path):
     return len(df) - len(ded)
 
 
+# ============================================================
+# 6c. parquet 文件完整性（半截文件）
+# ============================================================
+def check_parquet_integrity(all_years: bool = False):
+    """检查 parquet 文件是否完整（头尾魔数）
+
+    **为什么要有这个检查**：非原子写（`df.to_parquet(最终路径)`）被中断时，
+    文件会只剩一半 —— 头魔数 `PAR1` 还在，尾部变成零字节。实测
+    `frozen/daily_raw/year=2026/601089.parquet` 就是 1570 字节的截断文件。
+    它比"缺文件"更坏：读取方常见的 `except Exception: continue` 会把它当成
+    "这只股票没数据"跳过，于是坏文件**永远不会被重写**，一直烂到某次
+    全量重建才炸。
+
+    已修：`scripts/daily_update.py` 与 `database/storage.py` 一律走
+    `atomic_to_parquet`（写临时文件 -> 校验 footer -> os.replace）。
+    这里只是**事后哨兵**，用于发现别的原因造成的损坏（磁盘故障、别处直接写）。
+
+    ⚠️ 默认**只查每个数据集最新一年的分区** —— 那是日常更新写入的部分。
+    实测 1~25 秒（取决于系统文件缓存冷热；冷缓存约 22 秒）；
+    全库 25 万文件要 5 分钟以上，因此全量扫描必须显式 `--parquet-all`
+    （见 AGENTS.md 第 1 节：全局校验先问）。
+
+    占位年份（`config.NON_ANNUAL_YEAR`，financial/holders/st/suspend 这些
+    按代码分文件的静态数据集都塞在 `year=2005`）在默认模式下**跳过**：
+    它们有 1.6 万+ 文件却不是"最近更新"的，把它们算进"最新一年"会让这个
+    检查从 30 秒变成 200 秒（第一版就是这么写的，实测 201 秒）。
+    """
+    import time
+
+    from database.config import FROZEN_ROOT, NON_ANNUAL_YEAR
+    from database.storage import find_corrupt_parquet
+    mode = "全部年份" if all_years else "每个数据集最新一年（跳过占位年份）"
+    print(f"\n[parquet 完整性] 检查半截/损坏文件（{mode}）")
+    if not FROZEN_ROOT.exists():
+        report("frozen 目录存在", False, "不存在")
+        return
+    t0 = time.time()
+    bad, checked, ds_n, skipped = [], 0, 0, []
+    for d in sorted(FROZEN_ROOT.iterdir()):
+        if not d.is_dir():
+            continue
+        years = sorted(d.glob("year=*"))
+        if not years:
+            continue
+        if all_years:
+            targets = years
+        else:
+            last = years[-1]
+            if last.name == f"year={NON_ANNUAL_YEAR}":
+                skipped.append(d.name)
+                continue
+            targets = [last]
+        ds_n += 1
+        for y in targets:
+            files = list(y.glob("*.parquet"))
+            checked += len(files)
+            for f in find_corrupt_parquet(y, "*.parquet"):
+                bad.append((d.name, y.name, f.name, f.stat().st_size))
+    dt = time.time() - t0
+    for ds, yr, fn, sz in bad[:20]:
+        log(f"  ✗ {ds}/{yr}/{fn}  ({sz} 字节，魔数不对 = 半截文件)")
+    if len(bad) > 20:
+        log(f"  ... 另有 {len(bad) - 20} 个")
+    if skipped:
+        log(f"  ℹ 跳过占位年份数据集: {', '.join(skipped)}"
+            f"（--parquet-all 可覆盖）")
+    report("parquet 文件完整", not bad,
+           f"{len(bad)} 个文件损坏（半截文件，读取方会当成'没数据'静默跳过）—— "
+           f"用 `python scripts/daily_update.py --repair-corrupt` 隔离并重下整年"
+           if bad else
+           f"检查 {checked:,} 个文件（{ds_n} 个数据集，{mode}），耗时 {dt:.1f} 秒，"
+           f"全部完整")
+
 
 # ============================================================
 # 7. 数据新鲜度与消费方（B12）
@@ -1646,7 +1719,7 @@ def main():
                         choices=["unique", "schema", "coverage", "limit",
                                  "completeness", "status", "dates", "listing",
                                  "calendar", "freshness", "checkpoint",
-                                 "duplicates",
+                                 "duplicates", "parquet",
                                  "all"],
                         help="可重复指定，如 --check limit --check completeness；"
                              "不传等价于 all")
@@ -1661,6 +1734,9 @@ def main():
     parser.add_argument("--repair-duplicates", action="store_true",
                         help="配合 --check duplicates：把整行重复就地去掉"
                              "（下载器区间重叠造成的副本，非原始数据）")
+    parser.add_argument("--parquet-all", action="store_true",
+                        help="配合 --check parquet：扫描全部年份（25 万文件，"
+                             "5 分钟以上）。默认只查每个数据集最新一年，1~25 秒")
     parser.add_argument("--no-strict-exit", action="store_true",
                         help="即使发现问题也返回 0（默认发现问题返回 1，供 CI/调度做门禁）")
     args = parser.parse_args()
@@ -1670,7 +1746,7 @@ def main():
     if "all" in wanted:
         wanted = {"unique", "schema", "coverage", "limit", "completeness",
                   "status", "dates", "listing", "calendar",
-                  "freshness", "checkpoint", "duplicates"}
+                  "freshness", "checkpoint", "duplicates", "parquet"}
 
     if "unique" in wanted:
         for ds in ["daily", "frozen/valuation", "frozen/adjust"]:
@@ -1702,6 +1778,8 @@ def main():
         check_date_columns()
     if "duplicates" in wanted:
         check_row_duplicates(repair=args.repair_duplicates)
+    if "parquet" in wanted:
+        check_parquet_integrity(all_years=args.parquet_all)
 
     print("\n" + "=" * 60)
     if WARN:

@@ -12,17 +12,18 @@
 
 | 检查项 | 实测耗时 | 说明 |
 |---|---|---|
+| `parquet` | 1~25 秒 | 只查每个数据集最新一年并跳过占位年份；`--parquet-all` 要 5 分钟以上 |
 | `calendar` | ~18 秒 | |
-| `freshness` | ~107 秒 | 每个数据集都要取最大日期 |
-| `checkpoint` | ~294 秒 | 逐 key 比对磁盘 |
-| `limit` | > 180 秒 | 抽样 300 只算涨跌停 |
 | `duplicates` | ~40 秒 | 批量数据集全扫 + 按代码数据集抽样 |
+| `freshness` | ~107 秒 | 每个数据集都要取最大日期 |
+| `limit` | > 180 秒 | 抽样 300 只算涨跌停 |
+| `checkpoint` | ~294 秒 | 逐 key 比对磁盘 |
 | `schema` / `coverage` / `completeness` | **最慢** | 要扫 7 万+ 文件 / 5,889 只股票 |
 
 **规矩：跑之前先问。** 说清楚要查什么、为什么需要全量、预计多久，
 由人来决定值不值得。日常开发用**针对性**的单项目检查就够了，例如
-`--check duplicates`、`--check freshness`；只在数据层有实质改动、
-或准备发布结论时才考虑全量。
+`--check parquet`、`--check duplicates`、`--check freshness`；只在数据层有
+实质改动、或准备发布结论时才考虑全量。
 
 ---
 
@@ -47,8 +48,21 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 
 ## 3. 数据层的规矩
 
-- **frozen 是原始层**：只读。唯一的例外是**修复损坏数据**（例如去掉下载器
-  造成的整行重复），因为那不是"改原始数据"，是**还原**成 API 真实返回的样子。
+- **写 parquet 一律用 `database.storage.atomic_to_parquet`**，不要直接
+  `df.to_parquet(最终路径)`。非原子写被中断会留下**半截文件**（头魔数
+  `PAR1` 还在、尾部是零字节），而读取方常见的 `except Exception: continue`
+  会把它当成"这只标的没数据"跳过 —— 坏文件于是**永远不会被重写**，
+  一直烂到某次全量重建才炸。`daily_update.py` 已经因此挂过一次（B19）。
+  该函数写完会校验 footer，校验失败时**不替换最终文件**，旧数据还在。
+- **发现分片损坏时，绝不能"当作它不存在"**。那会把这次增量窗口当成全部
+  历史写进去，标的的多年数据被静默删除 —— 比留一个坏文件糟糕得多。
+  正确做法：拒绝写入 + 记录 + 报错，然后用
+  `python scripts/daily_update.py --repair-corrupt` 隔离并**重下整年**。
+- **检查文件完整性要同时看头尾魔数**。只看头会漏掉截断文件，那正是坏文件
+  的实际形态（`is_valid_parquet` 已经这么做了）。
+- **frozen 是原始层**：只读。唯一的例外是**修复损坏数据**（去掉下载器
+  造成的整行重复、隔离半截文件），因为那不是"改原始数据"，是**还原**成
+  API 真实返回的样子。
 - **派生层缓存按数据指纹失效**。改了 frozen 数据后，如果该数据集在
   `database.provenance.PANEL_DEPS` 里，面板缓存会自动作废；不在里面的
   （margin / northbound / futures / options / etf）不受影响。
@@ -57,6 +71,11 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 - 新增读取方后，`--check freshness` 的"读取方"一列应该能看到它。
   排在 `config.py` 里只是**登记**，`downloader/` 与 `download_*.py` 是
   **写入方**，都不算消费方。
+- **不要用 `ts.set_token()`**：它会往 `C:\Users\<user>\tk.csv` 写文件，
+  受限环境直接 PermissionError。用 `ts.pro_api(token)`，语义一样。
+- `db/cleaned/` 的重建是**就地覆盖**，中途失败会留下**半新半旧**的层
+  （按文件名排序，前面的股票是新数据、后面的是旧数据，而文件数完全正常）。
+  所以重建前必须备份，失败必须回滚。
 
 ---
 
