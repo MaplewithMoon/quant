@@ -63,6 +63,28 @@ def fmt_num(x):
     return f"{x:+.3f}" if pd.notna(x) else "-"
 
 
+def style_report(R, close, style_panels, factor_rets):
+    """风格分解段落：**残差 alpha 为主口径**，混口径降为参考行
+
+    A3 报的「Alpha +2.40%，p=0.646」之所以没意义，是因为它混着风格暴露 ——
+    "选股能力"与"小盘 beta"在那个数字里分不开。这里把风格解释掉再看残差。
+    """
+    from analytics.attribution import multi_factor_exposure
+    from analytics.style import residual_alpha, style_section
+
+    hold = R["full"]["result"].holdings
+    if hold is None or hold.empty or not style_panels:
+        return None
+    ret = close.pct_change()
+    port_ret = (hold.reindex(columns=ret.columns).fillna(0.0)
+                * ret.reindex(columns=hold.columns).fillna(0.0)).sum(axis=1)
+    expo = multi_factor_exposure(hold, style_panels)
+    st = residual_alpha(port_ret, expo, factor_rets)
+    if not st.get("residual", {}).get("n"):
+        return None
+    return style_section(st)
+
+
 def run_one(panel, mask, score, spec_kwargs, engine_kwargs, warmup_start,
             eval_start, eval_end, capital, risk_config=None, ctx=None):
     """跑一段回测并截断到评估窗口
@@ -246,6 +268,19 @@ def main():
     print(f"  ⚠ 已知缺陷: 本次触及 {len(_def)} 项 "
           f"({', '.join(d.key for d in _def) or '无'})，详见结尾报告")
 
+    # ---- 风格面板（PIT）：用于风格分解与**残差 alpha**（T1·④）----
+    # size 取面板逐日 total_mv（天然 PIT）；value 取 bp，已按 ann_date 对齐，
+    # 调仓日之间前向填充 —— 绝不用"当前"财报回填历史
+    from analytics.style import build_style_panels, cross_section_factor_returns
+    style_panels = build_style_panels(panel, close.index, close.columns,
+                                      fundamentals=factors)
+    _factor_rets = (cross_section_factor_returns(close.pct_change(), style_panels,
+                                                 mask=mask)
+                    if style_panels else None)
+    print(f"  风格面板: {list(style_panels)}"
+          + (f"   因子收益 {_factor_rets.shape[0]} 日"
+             if _factor_rets is not None else ""))
+
     # ---------- 2. 预注册规则挑因子 ----------
     banner("2. 因子集合（预注册规则 + 先验组合）", "-")
     rule_factors, prior_factors = [], ["bp", "ep_ttm", "turnover_20", "holder_chg"]
@@ -366,9 +401,14 @@ def main():
                 print()
                 # **统一渲染**：缺陷附注 / 前视自检 / 风控触发 / 被拦委托
                 # 都由 analytics/result_report.py 出，脚本不再各印一套（T1·⑤）
+                _extra = []
+                _st = style_report(R, close, style_panels, _factor_rets)
+                if _st:
+                    _extra = _st
                 print(r["result"].render(
                     title=f"{label}（{R['names']}，持股 {R['n_hold']}）"
-                          f"  {args.start} ~ {args.end}"))
+                          f"  {args.start} ~ {args.end}",
+                    extra_sections=_extra))
                 print(metrics_table(summ, BENCH_NAME))
                 ann = annual_returns_table(to_returns(ev), to_returns(b))
                 print(format_returns_table(ann, "分年度收益"))
