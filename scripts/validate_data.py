@@ -1326,16 +1326,26 @@ def backfill_checkpoint(datasets=None) -> dict:
 def _has_data_for(ds_dir, dataset: str, key: str) -> bool:
     """这个 key 在磁盘上是否真有数据（**按数据集的文件命名规则判定**）
 
-    ⚠️ 不能一律用 `**/{key}.parquet`：`financial` 的文件名是
-    `{sheet}_{code}.parquet`（profit_000001.parquet），`stocks`/`industry`/
-    `margin` 这类是 `all.parquet`/`data.parquet` 单文件。第一版没区分，
-    于是 `financial` 报出 5,889 条假阳性。
+    ⚠️ 三个坑，每一个都真实误报过：
+      1. 不能一律用 `**/{key}.parquet`：`financial` 的文件名是
+         `{sheet}_{code}.parquet`（profit_000001.parquet），
+         `stocks`/`industry`/`margin` 这类是 `all.parquet`/`data.parquet` 单文件。
+         第一版没区分，`financial` 报出 5,889 条假阳性。
+      2. **日期键有两种写法**：etf/options 的断点键是 `20200102`（无分隔符），
+         而文件是 `2020-01-02.parquet`（带连字符）。只按前者 glob，会把
+         **1,627 个完全正常的文件全报成缺失** —— 实跑完就是这么误报 361 条的。
+      3. 同一个 key 可能落在不同年份分区，必须递归找。
     """
     if key == "all":
         return any(ds_dir.glob("year=*/*.parquet"))
     if dataset == "financial":
         return any(ds_dir.glob(f"year=*/*_{key}.parquet"))
-    return any(ds_dir.glob(f"**/{key}.parquet"))
+    if any(ds_dir.glob(f"**/{key}.parquet")):
+        return True
+    if _looks_like_date_key(key):        # 20200102 -> 2020-01-02.parquet
+        dashed = f"{key[:4]}-{key[4:6]}-{key[6:]}"
+        return any(ds_dir.glob(f"**/{dashed}.parquet"))
+    return False
 
 
 def check_checkpoint(repair: bool = False, strict: bool = False):
