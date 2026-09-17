@@ -3,36 +3,65 @@ import pandas as pd
 from .base import BaseDownloader
 from .tushare_client import get_client
 
+# 季末日期：`(起始月日, 结束月日)`
+QUARTER_ENDS = (("0101", "0331"), ("0401", "0630"),
+                ("0701", "0930"), ("1001", "1231"))
+
+
+def quarter_ranges(start_year: int, end_year: int) -> list:
+    """生成按季度切分、**互不重叠**的 `(start_date, end_date)` 列表
+
+    ⚠️ 抽成独立函数是为了能测。原始写法把区间拼在 `download()` 里，出了这个
+    bug 也没法回归测试：
+
+        for m_start in ("0101", "0401", "0701", "1001"):
+            self._tc.call("margin", start_date=q, end_date=f"{q[:4]}1231")
+
+    季度起点配的是**年末**，于是 Q1 拉 1~12 月、Q2 拉 4~12 月、Q3 拉 7~12 月、
+    Q4 拉 10~12 月 —— 10 月以后的数据被拉了 4 遍。`pd.concat` 之后又没去重，
+    整行重复直接写进 parquet。实测 `frozen/margin` 2023 年 1,803 行里只有
+    726 行是真实的，`sum(rzye)` 被放大 2.5 倍；而主键 `(trade_date, exchange_id)`
+    仍然唯一，主键检查完全查不出来。
+
+    区间必须**闭合在季末**，且相邻区间首尾相接、不重叠。
+    """
+    out = []
+    for year in range(int(start_year), int(end_year) + 1):
+        for m_start, m_end in QUARTER_ENDS:
+            out.append((f"{year}{m_start}", f"{year}{m_end}"))
+    return out
+
 
 class MarginDownloader(BaseDownloader):
-    """两融余额（tushare margin，沪深两市日度）"""
+    """两融余额（tushare margin，沪/深/北三市日度）"""
     def __init__(self):
         super().__init__("margin", "margin", calls_per_min=200)
 
     def download(self, resume: bool = True):
         from tqdm import tqdm
+        import datetime
         self._tc = get_client()
         frames = []
-        # 按季度拉取
-        quarters = []
-        import datetime
-        y = datetime.datetime.now().year
-        for year in range(self.start_year, y + 1):
-            for m_start in ("0101", "0401", "0701", "1001"):
-                quarters.append(f"{year}{m_start}")
+        # 区间构造见 quarter_ranges 的 docstring（那里记着放大 2.5 倍的旧 bug）
+        quarters = quarter_ranges(self.start_year, datetime.datetime.now().year)
         with tqdm(total=len(quarters), desc="两融余额", ncols=100) as pbar:
-            for i, q in enumerate(quarters):
+            for i, (q0, q1) in enumerate(quarters):
                 self.storage.assert_disk_ok()
                 try:
-                    df = self._tc.call("margin", start_date=q,
-                                       end_date=f"{q[:4]}1231")
+                    df = self._tc.call("margin", start_date=q0, end_date=q1)
                     if df is not None and not df.empty:
                         frames.append(df)
                 except Exception as e:
-                    self.logger.warning(f"两融 {q} 失败: {e}")
+                    self.logger.warning(f"两融 {q0}~{q1} 失败: {e}")
                 pbar.update(1)
         if frames:
             data = pd.concat(frames, ignore_index=True)
+            n_raw = len(data)
+            # 二次防线：即使将来又出现区间重叠的写法，也不会把重复写进库
+            data = data.drop_duplicates()
+            if len(data) != n_raw:
+                self.logger.warning(f"两融去重: {n_raw} -> {len(data)} 行"
+                                    f"（丢弃 {n_raw - len(data)} 行重复）")
             data["trade_date"] = pd.to_datetime(data["trade_date"])
             data["year"] = data["trade_date"].dt.year
             for y, g in data.groupby("year"):

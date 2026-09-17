@@ -23,9 +23,15 @@
 ----
     from backtest.multi_engine import PortfolioBacktestEngine
 
-    eng = PortfolioBacktestEngine(initial_capital=1_000_000, rebalance_cost=True)
+    eng = PortfolioBacktestEngine(initial_capital=1_000_000)
     res = eng.run(price_panel, target_weights)   # 都是宽表 / dict of 宽表
     print(res.metrics.total_return, res.equity.iloc[-1])
+
+    # 带市场级择时（总仓位控制）：
+    from factors.market import market_signals, exposure_from_signal
+    sig = market_signals("2020-01-01", "2024-12-31")
+    expo = exposure_from_signal(sig["IC_basis"])
+    res = eng.run(price_panel, target_weights, exposure=expo)
 """
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -94,6 +100,7 @@ class PortfolioBacktestEngine:
 
     # ---------- 主循环 ----------
     def run(self, panel: dict, target_weights: pd.DataFrame,
+            exposure: Optional[pd.Series] = None,
             verbose: bool = False) -> MultiBacktestResult:
         """执行组合回测
 
@@ -102,7 +109,14 @@ class PortfolioBacktestEngine:
                     'limit_up'、'limit_down'、'suspended'（都是宽表）
             target_weights: 宽表，调仓日为权重、非调仓日为 NaN
                              （portfolio.construction.build_target_weights 的产出）
+            exposure: 目标总仓位（index=交易日, 0~1），可选。给定时**只在调仓日**
+                    缩放目标权重 —— 即择时只通过"这次调仓多买还是少买"生效，
+                    调仓日之间不因为信号变化而临时加减仓（那会引入大量无谓交易，
+                    也会把"信号噪声"当成调仓理由）。非调仓日与缺失日按 1.0 处理。
         """
+        if exposure is not None:
+            from factors.market import apply_exposure
+            target_weights = apply_exposure(target_weights, exposure)
         close = panel["close"]
         opn = panel.get("open", close)
 

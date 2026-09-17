@@ -1031,6 +1031,171 @@ def check_date_columns():
 
 
 # ============================================================
+# 6b. 行级完全重复（下载器批量 concat 后没去重）
+# ============================================================
+# 为什么必须单独查这个
+# --------------------
+# `--check unique` 查的是**主键**重复，而且只覆盖 daily/valuation/adjust 三个
+# 数据集。但真正发生过的事故是：`MarginDownloader` 按季度拉数时把 `end_date`
+# 写成了**年末**（`f"{q[:4]}1231"`），于是 Q1 拉了 1~12 月、Q2 又拉 4~12 月……
+# 10 月以后的数据被拉了 4 遍，`pd.concat` 之后**没有 drop_duplicates**，
+# 整行重复被原样写进 parquet。
+#
+# 后果很隐蔽：主键是 `(trade_date, exchange_id)`，**每个主键仍然唯一**
+# （重复行之间也一样），所以主键唯一性检查完全查不出来；但任何
+# `sum(rzye)` 都会拿到 ~2.5 倍的真实值。市场级信号、两融情绪指标全被污染。
+#
+# 所以这里查的是**整行**（所有列）完全一致，且**逐文件**做 —— 逐文件有两个
+# 好处：① 内存可控（`daily_raw`/`financial` 整库 DISTINCT 会 OOM）；② 能直接
+# 指出是哪个文件坏的。
+#
+# 为什么分两类扫
+# --------------
+# 实测各数据集的文件命名（2026-09 审计）：
+#   **批量写入** — 每个文件装**很多标的**或**整个市场**：`margin/data.parquet`
+#       （一年一文件）、`etf|options/2020-01-02.parquet`（一天一文件）、
+#       `futures/IC.parquet`。这类才会因为"多批 API 结果 concat"产生重复，
+#       **全量扫**，文件数少（合计约 3,400 个）。
+#   **按代码分文件** — `year=Y/{code}.parquet` 只装一只标的：daily_raw(7.3万)、
+#       valuation(7.2万)、adjust(7.3万)、financial(1.7万)、st/suspend/dividend/
+#       holders 各数千。文件数太大（20 万+）逐个 `DISTINCT *` 不现实，改成
+#       **抽样**：若是系统性的 concat 缺陷，每个文件都会中招，抽几十个必然命中
+#       （margin 那个 bug 就是 17 个文件全中）。
+PER_CODE_DATASETS = {
+    "daily_raw", "valuation", "adjust", "daily_basic", "limit_price",
+    "financial", "holders", "dividend", "st", "suspend", "index_daily",
+}
+# 抽样模式下每个「按代码」数据集查多少个文件
+SAMPLE_PER_CODE_FILES = 25
+
+
+def _dup_count(con, path) -> tuple:
+    """一个 parquet 文件里 (总行数, 去重后行数)"""
+    p = path.as_posix()
+    return con.execute(
+        f"SELECT (SELECT count(*) FROM read_parquet('{p}')), "
+        f"(SELECT count(*) FROM (SELECT DISTINCT * FROM read_parquet('{p}')))"
+    ).fetchone()
+
+
+def _spread_sample(files: list, n: int) -> list:
+    """从文件列表里**跨整个区间均匀**取 n 个
+
+    ⚠️ 不能直接 `files[:n]`：文件是按 `year=YYYY/代码` 排序的，前 25 个全是
+    2010 年的，等于只查了最老的一年 —— 而下载器 bug 往往只影响某段时间
+    （比如 margin 是"10 月以后被拉 4 遍"），偏采样会直接漏掉。
+    """
+    if len(files) <= n:
+        return files
+    step = len(files) / n
+    return [files[int(i * step)] for i in range(n)]
+
+
+def check_row_duplicates(repair: bool = False):
+    """逐文件检查「整行完全重复」
+
+    覆盖策略（实测耗时，2026-09）：
+      **批量数据集全扫**（margin 17 个文件、etf/options 各 1,627 个日期文件…）
+        —— 一次 `SELECT DISTINCT *` 约 0.01 秒，合计 ~13 秒。
+      **按代码数据集抽样**（`year=Y/{code}.parquet`，daily_raw/valuation/adjust
+        各 7 万余个，合计 20 万+）—— 逐个扫不现实；但若是系统性的 concat 缺陷，
+        每个文件都会中招，跨年均匀抽 25 个必然命中（margin 的 bug 就是 17 个
+        文件全中）。**这是抽样，不是全量**，报告里会写明。
+
+    repair=True 时把重复行**就地去掉**（原子写回）。去重去掉的是"API 根本没返回过、
+    纯由下载器区间重叠造出来的副本"，属于**还原**而不是篡改原始数据；但默认关闭，
+    必须显式 `--repair-duplicates` 才动数据。
+    """
+    from database.config import FROZEN_ROOT, connect_duckdb
+    print("\n[整行重复] 逐文件比对 count(*) 与 count(DISTINCT *)"
+          f"{'（并就地修复）' if repair else ''}")
+    if not FROZEN_ROOT.exists():
+        report("frozen 目录存在", False, "不存在")
+        return
+    bad, checked, full_ds, sampled_ds, repaired, unreadable = [], 0, [], [], [], 0
+    for d in sorted(FROZEN_ROOT.iterdir()):
+        if not d.is_dir():
+            continue
+        files = sorted(d.glob("year=*/*.parquet"))
+        if not files:
+            continue
+        if d.name in PER_CODE_DATASETS:
+            files = _spread_sample(files, SAMPLE_PER_CODE_FILES)
+            sampled_ds.append(d.name)
+        else:
+            full_ds.append(d.name)
+        # 每个数据集单独建连接：几万次查询堆在一个连接上会把 DuckDB 拖到 OOM
+        con = connect_duckdb()
+        ds_bad, ds_dup, ds_rows = [], 0, 0
+        try:
+            for f in files:
+                try:
+                    n, u = _dup_count(con, f)
+                except Exception as e:
+                    unreadable += 1
+                    if unreadable <= 5:
+                        log(f"  ⚠ {d.name}/{f.name}: 读取失败 {type(e).__name__}")
+                    continue
+                checked += 1
+                ds_rows += n
+                if n != u:
+                    ds_dup += n - u
+                    ds_bad.append((f.name, n, n - u))
+                    if repair:
+                        try:
+                            _dedupe_file(f)
+                            repaired.append((d.name, f.name, n - u))
+                        except Exception as e:
+                            log(f"  ✗ {d.name}/{f.name} 修复失败: "
+                                f"{type(e).__name__}: {e}")
+        finally:
+            con.close()
+        if ds_bad:
+            bad.append((d.name, ds_rows, ds_dup, ds_bad))
+
+    for name, rows, dup, detail in bad:
+        top = ", ".join(f"{fn}(+{dr:,})" for fn, _, dr in detail[:3])
+        log(f"  ✗ {name}: {len(detail)} 个文件有整行重复，多出 {dup:,} 行 "
+            f"[{top}{'...' if len(detail) > 3 else ''}]")
+    if unreadable:
+        log(f"  ⚠ 有 {unreadable} 个文件读不出来（无法判定重复）")
+    if repaired:
+        log(f"  已修复 {len(repaired)} 个文件，去掉 "
+            f"{sum(r[2] for r in repaired):,} 行重复")
+    total_dup = sum(b[2] for b in bad)
+    detail = (f"全量扫 {len(full_ds)} 个批量数据集 + 抽样 {len(sampled_ds)} 个"
+              f"按代码数据集（每个 {SAMPLE_PER_CODE_FILES} 文件），"
+              f"共 {checked:,} 个文件")
+    if bad:
+        report("frozen 无整行重复", False,
+               f"{len(bad)} 个数据集有整行重复（多出 {total_dup:,} 行）—— "
+               f"下游聚合会被放大"
+               + ("；已修复" if repair else "；加 --repair-duplicates 可就地修复"))
+    else:
+        report("frozen 无整行重复", True,
+               f"{detail}，未发现整行重复"
+               + ("（已修复）" if repair and repaired else ""))
+
+
+def _dedupe_file(path):
+    """去掉一个 parquet 文件里的整行重复，原子写回
+
+    复用 `Storage._atomic_to_parquet`：直接 `to_parquet(最终路径)` 时若进程被杀，
+    会留下读不出来的文件，而 `save()` 的 exists 跳过逻辑会让它永不被重写。
+    """
+    import pandas as pd
+
+    from database.storage import Storage
+    df = pd.read_parquet(path)
+    ded = df.drop_duplicates().reset_index(drop=True)
+    if len(ded) == len(df):
+        return 0
+    Storage._atomic_to_parquet(ded, path)
+    return len(df) - len(ded)
+
+
+
+# ============================================================
 # 7. 数据新鲜度与消费方（B12）
 # ============================================================
 # 每个数据集的"新鲜度预算"：`(类型说明, 提示阈值, 硬失败阈值)`，单位=天
@@ -1481,6 +1646,7 @@ def main():
                         choices=["unique", "schema", "coverage", "limit",
                                  "completeness", "status", "dates", "listing",
                                  "calendar", "freshness", "checkpoint",
+                                 "duplicates",
                                  "all"],
                         help="可重复指定，如 --check limit --check completeness；"
                              "不传等价于 all")
@@ -1492,6 +1658,9 @@ def main():
     parser.add_argument("--repair-checkpoint", action="store_true",
                         help="配合 --check checkpoint：把「标记完成但无数据」的"
                              "key 从断点里摘掉，让下次下载重试")
+    parser.add_argument("--repair-duplicates", action="store_true",
+                        help="配合 --check duplicates：把整行重复就地去掉"
+                             "（下载器区间重叠造成的副本，非原始数据）")
     parser.add_argument("--no-strict-exit", action="store_true",
                         help="即使发现问题也返回 0（默认发现问题返回 1，供 CI/调度做门禁）")
     args = parser.parse_args()
@@ -1501,7 +1670,7 @@ def main():
     if "all" in wanted:
         wanted = {"unique", "schema", "coverage", "limit", "completeness",
                   "status", "dates", "listing", "calendar",
-                  "freshness", "checkpoint"}
+                  "freshness", "checkpoint", "duplicates"}
 
     if "unique" in wanted:
         for ds in ["daily", "frozen/valuation", "frozen/adjust"]:
@@ -1531,6 +1700,8 @@ def main():
         check_status_panels()
     if "dates" in wanted:
         check_date_columns()
+    if "duplicates" in wanted:
+        check_row_duplicates(repair=args.repair_duplicates)
 
     print("\n" + "=" * 60)
     if WARN:

@@ -14,26 +14,17 @@ if __name__ == "__main__":
 import subprocess
 import sys
 
-TESTS = [
-    "tests/test_loader.py",
-    "tests/test_preprocessor.py",
-    "tests/test_engine.py",
-    "tests/test_ledger.py",
-    "tests/test_market_rules.py",
-    "tests/test_impact.py",
-    "tests/test_optimizer.py",
-    "tests/test_storage.py",
-    "tests/test_factors.py",
-    "tests/test_universe.py",
-    "tests/test_portfolio_backtest.py",
-    "tests/test_attribution.py",
-    "tests/test_performance.py",
-    "tests/test_sector_rotation.py",
-    "tests/test_fundamental.py",
-    "tests/test_joinquant.py",
-    "tests/test_limit_rules.py",
-    "tests/test_data_provenance.py",
-]
+# 自动发现，而不是硬编码清单。
+# 硬编码清单会**静默漏掉**新加的测试文件（`tests/test_market.py` 加进来时就
+# 没被发现，`run_tests.py` 一路绿灯但那个文件根本没跑）—— 而 pytest/CI 用的是
+# 自动发现，两边结果不一致，本地"全绿"就变得不可信。
+def _discover():
+    from pathlib import Path
+    d = Path(__file__).resolve().parent.parent / "tests"
+    return sorted(f"tests/{p.name}" for p in d.glob("test_*.py"))
+
+
+TESTS = _discover()
 
 
 def main():

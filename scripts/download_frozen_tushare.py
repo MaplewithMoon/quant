@@ -255,14 +255,43 @@ def download_etf(pro):
                               calls_per_min=60)
 
 
+def fetch_opt_basic(pro) -> pd.DataFrame:
+    """取**全部交易所**的期权合约列表并合并
+
+    ⚠️ 旧实现只写了 `exchange="SSE"`，于是 `opt_basic` 只有 12,000 个上交所
+    合约 —— 占期权日线里 226,402 个合约的 **4.6%**。后果是期权数据没法按
+    认购/认沽分类，Put/Call Ratio 只能算上交所那一小块
+    （`factors/market.py::load_option_pcr` 会在 attrs 里标注覆盖率）。
+
+    补齐只要 8 次调用，**不需要重下 2,300 万行日线** —— 所以单独开一个
+    `--only opt_basic` 入口。
+    """
+    limiter = RateLimiter(60)
+    frames = []
+    for ex in OPT_EXCHANGES:
+        try:
+            d = api_call(pro, "opt_basic", limiter, exchange=ex)
+        except Exception as e:
+            print(f"  [opt_basic] {ex} 失败: {str(e)[:60]}", flush=True)
+            continue
+        if d is None or d.empty:
+            continue
+        d = d.copy()
+        d["exchange"] = ex
+        frames.append(d)
+        print(f"  [opt_basic] {ex:<6} {len(d):>7,} 个合约", flush=True)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    return out.drop_duplicates(subset=["ts_code"])
+
+
 def download_options(pro):
     (FROZEN / "options").mkdir(parents=True, exist_ok=True)
-    try:
-        basic = api_call(pro, "opt_basic", RateLimiter(), exchange="SSE")
+    basic = fetch_opt_basic(pro)
+    if not basic.empty:
         basic.to_parquet(FROZEN / "options" / "opt_basic.parquet", index=False)
-        print(f"[options] 合约列表: {len(basic)} 个", flush=True)
-    except Exception as e:
-        print(f"[options] 合约列表失败: {str(e)[:60]}", flush=True)
+        print(f"[options] 合约列表: {len(basic):,} 个（全交易所）", flush=True)
     # **必须按交易所拆**：一把取恒定 15,000 行（单次上限），实测拆开合计 26,566 行
     _download_by_trading_days(pro, "options", "opt_daily", "options日线",
                               calls_per_min=100, exchanges=OPT_EXCHANGES)
@@ -270,7 +299,9 @@ def download_options(pro):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--only", choices=["adjust", "st", "valuation", "etf", "options", "all"], default="all")
+    parser.add_argument("--only", choices=["adjust", "st", "valuation", "etf",
+                                           "options", "opt_basic", "all"],
+                        default="all")
     parser.add_argument("--codes", default="", help="指定股票")
     parser.add_argument("--fresh", action="store_true", help="忽略断点，从头重新下载")
     args = parser.parse_args()
@@ -281,6 +312,18 @@ def main():
         return
     ts.set_token(token)
     pro = ts.pro_api()
+
+    # 只补期权合约列表：不碰日线、不碰断点（8 次调用，秒级完成）
+    if args.only == "opt_basic":
+        (FROZEN / "options").mkdir(parents=True, exist_ok=True)
+        basic = fetch_opt_basic(pro)
+        if basic.empty:
+            print("未取到任何合约", flush=True)
+            return
+        basic.to_parquet(FROZEN / "options" / "opt_basic.parquet", index=False)
+        print(f"[opt_basic] 已写入 {len(basic):,} 个合约（全交易所），"
+              f"日线与断点未改动", flush=True)
+        return
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     if not codes:
