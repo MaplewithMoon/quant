@@ -7,10 +7,13 @@ db/
 
 # ============================================================
 #  密钥与凭证 —— 绝对不能提交
-#  database/token.py 会读取这些文件中的 tushare token
+#  database/token.py 会读取这些文件中的 tushare token / 聚宽账号
+#  ⚠️ jqdata_account.txt 里是**登录密码**（不是 token），更要小心
 # ============================================================
 tushare_token.txt
 **/tushare_token.txt
+jqdata_account.txt
+**/jqdata_account.txt
 .env
 .env.*
 *.key
