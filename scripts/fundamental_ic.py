@@ -215,6 +215,15 @@ def main():
         out_ls, out_mono = _ls_mono(qr.loc[qr.index >= split] if qr is not None
                                     and not qr.empty else pd.DataFrame())
 
+        # ---- 因子门禁（T1·③）：**入库时就打标**，让坏消息尽早暴露 ----
+        # 与 multifactor_backtest.py 的分工：那边在回测启动时读标记，
+        # 这边在因子入库时写标记。两处都不**剔除**因子，只标记。
+        from factors.gate import gate_check
+        try:
+            _g = gate_check(f, fwd, split_point=args.split, label=name)
+        except Exception:
+            _g = {"status": "SKIP", "reasons": ["门禁执行失败"], "conditions": {}}
+
         rows.append({
             "因子": name, "中文名": FACTOR_META.get(name, ("", 0))[0],
             "方向": FACTOR_META.get(name, ("", 1))[1],
@@ -225,11 +234,19 @@ def main():
             "外ICIR": b["ICIR"], "外正IC占比": b["正IC占比"], "外期数": b["期数"],
             "外多空年化": out_ls, "外单调性": out_mono,
             "全IC": full["IC"], "全t": full["t"],
+            # 门禁标记：**保留不合格因子**，只打标（静默剔除会造出
+            # "被审查过的幸存者因子库"，与股票池的幸存者偏差是同构的病）
+            "门禁": _g.get("status", "SKIP"),
+            "门禁原因": "；".join(_g.get("reasons") or []),
             "_秒": time.time() - t2,
         })
+        _mark = {"PASS": "", "WARN": " ⚠", "FAIL": " ⛔", "SKIP": " ?"}.get(
+            _g.get("status", "SKIP"), "")
         print(f"  {name:<14} 内IC {a['IC']:+.4f}(t{a['t']:+.2f}) 内多空 {in_ls:+.1%}  "
               f"| 外IC {b['IC']:+.4f}(t{b['t']:+.2f}) 外多空 {out_ls:+.1%}   "
-              f"({time.time()-t2:.1f}s)")
+              f"({time.time()-t2:.1f}s){_mark}"
+              + (f"  [{_g.get('status')}] {'；'.join(_g.get('reasons') or [])}"
+                 if _g.get("status") in ("WARN", "FAIL") else ""))
 
     tab = pd.DataFrame(rows).sort_values("外IC", key=lambda s: s.abs(),
                                          ascending=False).reset_index(drop=True)

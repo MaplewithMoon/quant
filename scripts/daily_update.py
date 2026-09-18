@@ -30,6 +30,7 @@ from database.token import load_token
 from database.config import FROZEN_ROOT, dir_of, parquet_glob
 from database.storage import atomic_to_parquet, is_valid_parquet
 from scripts._tushare_common import RateLimiter, api_call, ts_code_of, check_disk
+from utils.alert import error as alert_error, warn as alert_warn
 
 # 路径统一走 database.config，禁止再手写 "db/xxx" 字符串
 DB = FROZEN_ROOT.parent                 # db/
@@ -542,6 +543,10 @@ def main():
         print("   " + ", ".join(f"{ds}/{c}" for ds, c in sorted(CORRUPT_FOUND)[:10])
               + ("..." if len(CORRUPT_FOUND) > 10 else ""))
         print("   修：python scripts/daily_update.py --repair-corrupt")
+        # 这是"静默少数据"，必须告警 —— B19 那次就是被吞掉才没人发现
+        alert_warn(f"日常更新跳过了 {len(CORRUPT_FOUND)} 只损坏分片",
+                   "、".join(f"{ds}/{c}" for ds, c in sorted(CORRUPT_FOUND)[:10]),
+                   n=len(CORRUPT_FOUND))
 
     # 重建清洗层 + 涨跌停价（当年）
     # 重建阶段是**就地覆盖**清洗层，所以两种模式都要先备份：
@@ -557,6 +562,10 @@ def main():
         # 必须回滚，不能让这种层留在磁盘上。
         print(f"\n⚠ {n_bad} 个 frozen 分片读不出来，清洗层不完整（会半新半旧）。")
         print("  先修数据：python scripts/daily_update.py --repair-corrupt")
+        alert_error("日常更新失败：清洗层不完整，已回滚",
+                    f"{n_bad} 个分片读不出来；"
+                    f"修：python scripts/daily_update.py --repair-corrupt",
+                    n_bad=n_bad, year=year)
         rollback_daily(backup)
         return 1
     rebuild_limit_year(year)
@@ -567,6 +576,8 @@ def main():
         ok, problems = run_validation()
         if not ok:
             print("校验未通过，执行回滚...")
+            alert_error("日常更新失败：更新后校验未通过，已回滚",
+                        "；".join(problems)[:500], year=year)
             rollback_daily(backup)
             print("已回滚。请检查数据源问题后重试。")
             return 1
@@ -583,4 +594,15 @@ def main():
 
 if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as _e:            # 崩溃也要出声，不能静默退出
+        # ⚠️ BaseException：DiskFullError 之类的磁盘保护继承自它，
+        # 原先会被 `except Exception` 漏掉
+        try:
+            alert_error("日常更新异常退出", f"{type(_e).__name__}: {_e}")
+        except Exception:
+            pass
+        raise

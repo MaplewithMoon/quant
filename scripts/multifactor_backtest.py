@@ -492,8 +492,7 @@ def main():
           "因子集合用预注册规则或先验确定，不参与调参。")
 
     with open(os.path.join(args.outdir, "report.json"), "w", encoding="utf-8") as fh:
-        json.dump({
-            "区间": {"训练集": [args.start, args.split], "测试集": [args.split, args.end]},
+        json.dump({            "区间": {"训练集": [args.start, args.split], "测试集": [args.split, args.end]},
             "因子集合": {k: v["names"] for k, v in results.items()},
             "持股数": {k: v["n_hold"] for k, v in results.items()},
             "对照": cmp.replace({np.nan: None}).to_dict("records"),
@@ -504,6 +503,27 @@ def main():
                          "impact_k": args.impact_k if args.impact_model == "sqrt" else None},
             "组合风控": risk_config,
         }, fh, ensure_ascii=False, indent=2, default=str)
+    # ---- 结果快照（T3·E4）：记下 commit + 数据指纹 + 参数 + 结果哈希 ----
+    # 这个项目已两次因数据修复而结论变化，但没有机制知道**哪些结论过期了**。
+    # 快照落到 outdir，`analytics.snapshot.stale_snapshots()` 能直接报出来。
+    try:
+        from analytics.snapshot import write_snapshot
+        _first = next(iter(results.values()), None)
+        if _first:
+            _p = write_snapshot(
+                _first["full"]["result"], args.outdir,
+                label=f"多因子 {args.start}~{args.end}",
+                params={"start": args.start, "split": args.split, "end": args.end,
+                        "capital": args.capital, "slippage": args.slippage,
+                        "impact_model": args.impact_model,
+                        "fill_timing": args.fill_timing,
+                        "rebalance": args.rebalance,
+                        "risk_config": risk_config},
+                extra={"组合": {k: v["names"] for k, v in results.items()}})
+            print(f"  结果快照 -> {_p}")
+    except Exception as _e:
+        print(f"  （结果快照写入失败，不影响回测: {type(_e).__name__}）")
+
     print(f"\n  产出 -> {args.outdir}/")
     banner(f"完成，总用时 {time.time()-t0:.0f}s")
     return 0

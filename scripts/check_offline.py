@@ -46,6 +46,8 @@ DEFAULT = (
     "tests/test_market_rules.py",
     "tests/test_atomic_write.py",
     "tests/test_cli.py",
+    "tests/test_alert.py",              # 告警（合成）
+    "tests/test_regression_baseline.py",  # 回归基准 + 快照（合成）
 )
 MARK = "__OFFLINE_RESULT__"
 
