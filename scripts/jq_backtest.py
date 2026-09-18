@@ -142,6 +142,23 @@ def main():
         print(f"  卡玛 {summ['calmar_ratio']:+.3f}  索提诺 {summ['sortino_ratio']:+.3f}  "
               f"换手相关：持仓 {eng.pf.positions and len(eng.pf.positions)} 只")
 
+        # ---- 交易记录 / 收益分析（对齐聚宽平台的两份导出）----
+        # 为什么要落这份文本：净值曲线对不上时，必须能逐笔核对"这笔到底成交没有、
+        # 为什么没成交"。详见 analytics/trade_log.py 的模块说明。
+        from analytics.trade_log import audit_line, export_trade_log
+        log_out = export_trade_log(
+            res.get("trades"), eq, bench if bench is not None else None,
+            outdir=args.outdir, tag=f"_{key}_{args.start}_{args.end}",
+            rejects=res.get("reject_log"), initial_cash=args.capital,
+            fill_time="09:30" if args.fill in ("auto", "open") else "15:00",
+            label=f"{label}  {args.start} ~ {args.end}")
+        print(f"  交易记录 -> {log_out['files']['交易记录']}"
+              f"（{len(log_out['trades'])} 笔）")
+        print(f"  收益分析 -> {log_out['files']['收益分析']}")
+        print(f"  成交回合 -> {log_out['files']['成交回合csv']}"
+              f"（{len(log_out['round_trips'])} 个回合）")
+        print(audit_line(log_out["audit"]))
+
         # ---- 聚宽风格 HTML 报告 ----
         from analytics.jq_report import build_jq_report
         html_path = os.path.join(args.outdir, f"report_{key}.html")

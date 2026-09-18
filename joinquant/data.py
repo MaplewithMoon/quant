@@ -141,6 +141,20 @@ def to_ts_code(code: str) -> str:
     return c
 
 
+def profit_parquet_glob() -> str:
+    """利润表 parquet 的 glob —— **必须限定 `profit_*`**
+
+    `frozen/financial/year=*/` 同一目录下有三张报表（balance/profit/cashflow），
+    列完全不同。写成 `year=*/*.parquet` 会让同一份报告出现三行（各填自己那张
+    表的列），配合 `drop_duplicates(..., keep="first")` 会系统性留下资产负债表
+    行 —— 利润表字段全 NaN。详见 `JQData._load_financials` 的说明。
+
+    单独抽成函数是为了让测试能直接断言这个前缀，而不是靠"跑一遍看结果"。
+    """
+    from database.config import FROZEN_ROOT
+    return f"{(FROZEN_ROOT / 'financial').as_posix()}/year=*/profit_*.parquet"
+
+
 class JQData:
     """聚宽数据接口的本地实现（预加载到内存，查询走内存索引）"""
 
@@ -219,15 +233,33 @@ class JQData:
         只保留 (code, ann_date, end_date, revenue, n_income, n_income_attr_p)。
         同一 (code, end_date) 多次公告只认**最早**那次（as-reported），
         与 factors/fundamental.py 的口径完全一致。
+
+        ⚠️⚠️ glob **必须限定到 `profit_*`**（2026-09 修）
+        --------------------------------------------------
+        `frozen/financial/year=*/` 一个目录里同时躺着 `balance_*` / `profit_*` /
+        `cashflow_*` 三张报表的文件，列完全不同。原先按 `year=*/*.parquet` 配
+        `union_by_name=True` 读，会把**同一份报告读成三行**（各自只填自己那张表
+        的列）。而 glob 是按文件名排的：`balance_` < `cashflow_` < `profit_`，
+        于是 `sort_values(...).drop_duplicates(["code","end_date"], keep="first")`
+        几乎**必然**留下资产负债表那一行 —— 利润表三个字段恒为 NaN。
+
+        后果（实测，2024-02 ~ 2025-12 逐月抽样 963~980 只全为 0 行）：`get_fundamentals`
+        里 `income.*` 的过滤条件恒为 False，两个移植策略的 `get_stock_list()`
+        每次都返回空 -> `return [g.etf]` -> **策略全程空仓买货币 ETF**，
+        本地"累计 +2.36%"与聚宽"+185.52%"的差距**根本不是撮合保真度**，
+        而是这条静默的数据读取错误。
+
+        `factors/fundamental.py::_read_statements` 一直是对的（它按 `{kind}_`
+        限定 glob），本函数当初照抄了它的去重逻辑却漏掉了前缀。
         """
+        from database.config import FROZEN_ROOT, connect_duckdb
+        profit_glob = profit_parquet_glob()
         # ⚠️ 不能写死 `year=*`：没有 db/ 时 DuckDB 会抛
         # `IOException: No files found that match the pattern`，而这里是
         # `try/finally`（没有 except），异常会直接冒出去 —— 于是**任何**
         # `JQData(合成面板)` 都建不起来，测试在无数据库的环境（CI）里全挂。
-        # `year_globs()` 在数据集不存在时返回 "[]"，据此跳过查询即可。
-        from database.config import FROZEN_ROOT, connect_duckdb, year_globs
-        glob = year_globs(FROZEN_ROOT / "financial")
-        if glob == "[]":
+        # 没有真实文件时直接返回空表。
+        if not any((FROZEN_ROOT / "financial").glob("year=*/profit_*.parquet")):
             self._fin = pd.DataFrame()
             self._fin_dates = np.array([], dtype="datetime64[ns]")
             return
@@ -236,7 +268,7 @@ class JQData:
             df = con.execute(
                 f"SELECT code, ann_date, end_date, report_type, revenue, "
                 f"n_income, n_income_attr_p "
-                f"FROM read_parquet({glob}, union_by_name=True) "
+                f"FROM read_parquet('{profit_glob}', union_by_name=True) "
                 f"WHERE report_type = '1'").fetchdf()
         finally:
             con.close()
@@ -482,8 +514,36 @@ class JQData:
     # 行情查询
     # ===========================================================
     def _frame(self, field: str) -> pd.DataFrame:
-        return {"close": self._close, "open": self._open, "high": self._high,
-                "low": self._low, "pre_close": self._pre_close}.get(field, self._close)
+        """按字段名取宽表
+
+        ⚠️⚠️ **未知字段一律返回全 NaN，绝不退回 close**（2026-09 修）
+        ------------------------------------------------------------
+        原先的写法是 `.get(field, self._close)` —— 任何没登记的字段都静默变成
+        **收盘价**。而两个策略的 `prepare_stock_list()` 都要用
+        `get_price(..., fields=['close','high_limit','low_limit'])` 判断
+        "昨日是否涨停"：
+
+            df[df['close'] == df['high_limit']]
+
+        `high_limit` 拿到的是 close 本身 -> **恒等成立** -> `g.yesterday_HL_list`
+        等于全部持仓；紧接着 14:00 的 `check_limit_up()` 拿**真实涨停价**
+        （走 cleaned/limit_price 面板）去比 -> `close < high_limit` 几乎恒真
+        -> **每个持仓每天都被"涨停打开卖出"**。实测 v2 在 2024-02~06 共触发
+        173 次卖出、只有 3 次"继续持有"，累计收益从 +257% 掉到 +1.3%。
+
+        这个坑和 `_load_financials` 是同一类：**静默兜底比报错危险得多**。
+        真需要兜底时给 NaN，让调用方看见"这里没有数据"。
+        """
+        m = {"close": self._close, "open": self._open, "high": self._high,
+             "low": self._low, "pre_close": self._pre_close,
+             "high_limit": self._limit_up, "low_limit": self._limit_down,
+             "volume": self.panel.get("volume"),
+             "money": self.panel.get("amount"), "amount": self.panel.get("amount")}
+        f = m.get(field)
+        if f is not None:
+            return f
+        return pd.DataFrame(np.nan, index=self._close.index,
+                            columns=self._close.columns)
 
     def history(self, field: str, codes: List[str], end_date, count: int) -> pd.DataFrame:
         """返回 截止 end_date（含）的最后 count 根日线，columns=股票代码
@@ -503,7 +563,13 @@ class JQData:
         return LegacyFrame(out)
 
     def current_bar(self, date) -> pd.DataFrame:
-        """当日"盘中快照"：用开盘价近似（策略在 10:00 左右下单）"""
+        """当日"盘中快照"：用开盘价近似（策略在 10:00 左右下单）
+
+        ⚠️ 返回的是 **index=股票代码, columns=['open','high','low','close']**
+        （`pd.DataFrame({字段: 按代码索引的 Series})` 的自然结果）。
+        `history(unit='1m')` 里 `row["open"]` 就是靠这个方向；
+        `get_price(frequency='1m')` 曾经按相反方向取，导致整列 NaN（已修）。
+        """
         if date not in self._open.index:
             return pd.DataFrame()
         d = {"open": self._open.loc[date], "high": self._high.loc[date],

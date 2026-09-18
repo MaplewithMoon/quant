@@ -379,20 +379,44 @@ def get_price(security, end_date=None, frequency="daily", fields=None,
     fields = [fields] if isinstance(fields, str) else (fields or ["close"])
 
     if frequency in ("1m", "minute") or frequency.startswith("1"):
-        # 分钟线没有：用当日开盘价当"当前价"。
-        # ⚠️ current_bar 的返回是 **index=字段, columns=代码**（转置过的），
-        # 一开始按"代码×字段"去 sub.get(f) 取列，直接 KeyError: 'open'。
+        # 分钟线没有：用当日"盘中快照"当当前价（`--fill auto` 口径：上午看开盘、
+        # 下午看收盘，见 JQEngine._fill_price）。
+        #
+        # ⚠️⚠️ `current_bar()` 的返回是 **index=股票代码, columns=open/high/low/close**
+        # （`pd.DataFrame({字段: Series(按代码)})` 的自然结果）。原先这里按
+        # "index=字段, columns=代码" 去取，于是 `'close' in bar.index` 恒 False
+        # -> `src` 全部退回 "open"，而 `c in bar.columns` 也恒 False -> **整列 NaN**。
+        # 症状：v1 的 `check_limit_up()` 里 `close < high_limit` 恒为 False
+        # （NaN 比较），"涨停打开就卖、第二天回补"这条路径**完全死掉** ——
+        # 本地 v1 只有 29 个个股成交日，聚宽有 89 天，差的就是这条路径。
+        #
+        # 另外 `high_limit` / `low_limit` 聚宽是真实涨跌停价，**不能拿开盘价顶替**：
+        # 直接取 cleaned/limit_price 面板（`get_current_data()` 就是这么做的）。
         bar = _d().current_bar(pd.Timestamp(eng.current_date))
         if bar.empty:
             return LegacyFrame(columns=fields)
+        dd = pd.Timestamp(eng.current_date)
+        lu, ld = _d().limit_prices(dd)
+        pre = getattr(_d(), "_pre_close", None)
+        pre_row = pre.loc[dd] if pre is not None and dd in pre.index else None
         recs = []
         for c in codes:
             rec = {"code": c}
             for f in fields:
-                src = f if f in bar.index else "open"
-                v = bar.at[src, c] if (c in bar.columns and pd.notna(bar.at[src, c])) \
-                    else np.nan
-                rec[f] = float(v)
+                if c in bar.index and f in bar.columns:
+                    v = bar.at[c, f]
+                elif f == "high_limit":
+                    v = lu.get(c) if lu is not None and c in lu.index else np.nan
+                elif f == "low_limit":
+                    v = ld.get(c) if ld is not None and c in ld.index else np.nan
+                elif f == "pre_close":
+                    v = pre_row.get(c) if pre_row is not None else np.nan
+                elif f in ("last_price", "price"):
+                    v = bar.at[c, "close"] if c in bar.index else np.nan
+                else:
+                    # 既不是盘中快照字段也没有真实来源 -> 退回开盘价（**近似**，见文档）
+                    v = bar.at[c, "open"] if c in bar.index else np.nan
+                rec[f] = float(v) if pd.notna(v) else np.nan
             recs.append(rec)
         long = pd.DataFrame(recs)
         if single:
@@ -688,6 +712,10 @@ class JQEngine:
         self.verbose = verbose
         self.volume_limit = volume_limit
         self.rejections: Dict[str, int] = {}
+        # 逐笔拒单明细。聚宽的「交易记录」导出里**含未成交的委托**
+        # （成交数量 0、成交价为空），只统计次数的话对照实验里就没法回答
+        # "这一笔是没买进还是根本没下单"。字段与 multi_engine 的 reject_log 对齐。
+        self.reject_log: List[dict] = []
         self.trades: List[dict] = []
         self.current_dt = datetime.datetime.combine(data.dates[0].date(),
                                                     datetime.time(9, 30))
@@ -786,8 +814,14 @@ class JQEngine:
         except (KeyError, TypeError):
             return None
 
-    def _reject(self, why):
+    def _reject(self, why, code=None, side=None, qty=None, px=None):
         self.rejections[why] = self.rejections.get(why, 0) + 1
+        self.reject_log.append({
+            "date": self.current_date, "code": code or "",
+            "side": side or "", "qty": qty if qty is not None else "",
+            "px": float(px) if isinstance(px, (int, float)) else "",
+            "reason": why,
+        })
 
     # ---------- 下单 ----------
     def order_target_value(self, code, value) -> Optional[Order]:
@@ -795,7 +829,7 @@ class JQEngine:
         d = pd.Timestamp(eng.current_date)
         px = eng._fill_price(code, d, eng._minutes)
         if px is None or not np.isfinite(px) or px <= 0:
-            eng._reject("无有效成交价（停牌/未上市）")
+            eng._reject("无有效成交价（停牌/未上市）", code, "buy", value, None)
             return None
         target_size = max(float(value), 0.0) / px
         # 按一手取整（聚宽同样只接受 100 股整数倍）
@@ -806,7 +840,7 @@ class JQEngine:
         d = pd.Timestamp(self.current_date)
         px = self._fill_price(code, d, self._minutes)
         if px is None or px <= 0:
-            self._reject("无有效成交价（停牌/未上市）")
+            self._reject("无有效成交价（停牌/未上市）", code, "sell", amount, None)
             return None
         tgt = float(int(max(amount, 0.0) // 100) * 100)
         return self._trade_to(code, tgt, px, d)
@@ -826,21 +860,21 @@ class JQEngine:
         if diff > 0:                      # 买入
             ok, why = self.rules.check_buy(bar, px)
             if not ok:
-                self._reject(why)
+                self._reject(why, code, "buy", diff, px)
                 order.reason = why
                 return order
             cash = self.pf.cash
             size = self.broker.max_affordable_size(cash, px, self._volume(code, d))
             size = min(diff, size)
             if size < 100:
-                self._reject("现金不足一手")
+                self._reject("现金不足一手", code, "buy", diff, px)
                 order.reason = "现金不足"
                 return order
             fees = self.fees_of(size * px, OrderSide.BUY)
             try:
                 self.pf.buy(code, size, px, fees=fees)
             except ValueError as e:
-                self._reject(str(e)[:40])
+                self._reject(str(e)[:40], code, "buy", size, px)
                 order.reason = str(e)[:60]
                 return order
             order.filled, order.fees, order.status = size, fees, OrderStatus.held
@@ -851,19 +885,19 @@ class JQEngine:
         else:                             # 卖出
             ok, why = self.rules.check_sell(bar, px)
             if not ok:
-                self._reject(why)
+                self._reject(why, code, "sell", abs(diff), px)
                 order.reason = why
                 return order
             size = min(abs(diff), self.pf.sellable_size(code))
             if size < 1:
-                self._reject("T+1 当日买入不可卖")
+                self._reject("T+1 当日买入不可卖", code, "sell", abs(diff), px)
                 order.reason = "T+1"
                 return order
             fees = self.fees_of(size * px, OrderSide.SELL)
             try:
                 pnl = self.pf.sell(code, size, px, fees=fees)
             except ValueError as e:
-                self._reject(str(e)[:40])
+                self._reject(str(e)[:40], code, "sell", size, px)
                 order.reason = str(e)[:60]
                 return order
             order.filled, order.fees, order.status = size, fees, OrderStatus.held
@@ -912,7 +946,8 @@ class JQEngine:
                     msg = f"{type(e).__name__}: {e}{where}"
                     log.error(f"{task.func.__name__} 异常: {msg}\n"
                               f"{traceback.format_exc()}")
-                    self._reject(f"策略异常 {task.func.__name__}: {msg[:90]}")
+                    self._reject(f"策略异常 {task.func.__name__}: {msg[:90]}",
+                                 code="", side="", qty="", px=None)
             # 收盘估值
             for c in list(self.pf.positions.keys()):
                 px = self.price_of(c, d)
@@ -929,6 +964,7 @@ class JQEngine:
                 "holdings": pd.DataFrame(holdings, index=eq.index),
                 "trades": pd.DataFrame(self.trades),
                 "rejections": dict(self.rejections),
+                "reject_log": list(self.reject_log),
                 "log": list(log.lines)}
 
     @staticmethod

@@ -475,6 +475,21 @@ def main():
                     save_csv(r["trades"],
                              os.path.join(args.outdir, f"trades_{label}.csv"),
                              index_label="idx")
+                    # 聚宽风格的「交易记录」+「收益分析」+「成交回合」：
+                    # 净值对不上时，必须能逐笔核对"这笔到底成交没有、为什么没成交"。
+                    # 见 analytics/trade_log.py 的模块说明。
+                    from analytics.trade_log import audit_line, export_trade_log
+                    from execution.setup import FILL_SAME_CLOSE
+                    tl = export_trade_log(
+                        r["trades"], ev, b.reindex(ev.index),
+                        outdir=args.outdir, tag=f"_{label}",
+                        rejects=getattr(r["result"], "rejection_detail", None),
+                        initial_cash=args.capital,
+                        fill_time="15:00" if args.fill_timing == FILL_SAME_CLOSE else "09:30",
+                        label=f"多因子选股（{label}）  {args.start} ~ {args.end}")
+                    print(f"  交易记录 -> {tl['files']['交易记录']}")
+                    print(f"  收益分析 -> {tl['files']['收益分析']}")
+                    print(audit_line(tl["audit"]))
 
     banner("5. 对照汇总（结论看这里）", "-")
     show = cmp.copy()

@@ -321,6 +321,58 @@ def test_index_proxy_excludes_unlisted():
     print("[OK] 指数代理按 list_date 剔除未上市股票（规则重建兜底路径）")
 
 
+def test_unknown_history_field_is_nan_not_close():
+    """`history()`/`get_price()` 取未知字段必须给 NaN，**不能退回 close**
+
+    回归测试。原先 `_frame()` 写的是 `.get(field, self._close)`，于是
+    `fields=['close','high_limit']` 里 `high_limit` 变成收盘价本身：
+    `df[df['close'] == df['high_limit']]` 恒成立 -> `g.yesterday_HL_list`
+    等于全部持仓 -> 14:00 的 `check_limit_up()` 拿真实涨停价比一次就几乎必然
+    `close < high_limit` -> **每个持仓每天都被卖掉**（实测 v2 五个月触发 173 次
+    "涨停打开卖出"、只有 3 次"继续持有"）。真需要兜底时给 NaN，让调用方看得见。
+    """
+    p, dates = _panel(n_days=8)
+    mgr = JQData(p, dates[0], dates[-1])
+    hl = mgr.history("high_limit", ["000001"], dates[-1], 1)
+    assert abs(float(hl["000001"].iloc[-1])
+               - float(p["limit_up"].at[dates[-1], "000001"])) < 1e-9, \
+        "high_limit 取到的不是真实涨停价"
+    junk = mgr.history("not_a_field", ["000001"], dates[-1], 1)
+    assert junk["000001"].isna().all(), "未知字段应返回 NaN，而不是退回 close"
+    print("[OK] 未知行情字段返回 NaN（不退回 close）；high_limit 取真实涨停价")
+
+
+def test_get_price_intraday_fields_are_not_all_nan():
+    """`get_price(frequency='1m')` 的盘中字段**不能整片 NaN**
+
+    回归测试。`current_bar()` 返回的是 index=代码 / columns=open/high/low/close，
+    而这里曾经按相反方向取列，于是每个字段都落到 `else np.nan`：
+    `check_limit_up()` 里 `close < high_limit` 恒为 False（NaN 比较），
+    "涨停打开就卖、次日回补"这条路径完全死掉 —— 本地 v1 只有 29 个个股成交日，
+    聚宽有 89 天，差的主要就是它。
+
+    同时盯住：`high_limit` 必须是**真实涨跌停价**，不能拿开盘价顶替。
+    """
+    p, dates = _panel(n_days=6)
+    eng = JQEngine(JQData(p, dates[0], dates[-1]), 100_000.0)
+    from joinquant.api import get_price
+    for i, d in enumerate(dates[1:4], start=1):
+        eng.current_date = d
+        eng.current_dt = d + pd.Timedelta(hours=14)
+        x = get_price("000001", end_date=d, frequency="1m",
+                      fields=["close", "high_limit", "low_limit"], count=1,
+                      panel=False)
+        close = float(x.iloc[0, 0])
+        hl, ll = float(x.iloc[0, 1]), float(x.iloc[0, 2])
+        assert np.isfinite(close), f"{d} close 是 NaN"
+        assert np.isfinite(hl) and np.isfinite(ll), f"{d} 涨跌停价是 NaN"
+        assert abs(close - float(p["close"].at[d, "000001"])) < 1e-9
+        assert abs(hl - float(p["limit_up"].at[d, "000001"])) < 1e-9, \
+            "high_limit 不是真实涨停价（很可能又退回开盘价了）"
+        assert hl > ll and ll > 0
+    print("[OK] get_price(1m) 盘中字段有值，且 high_limit/low_limit 取真实涨跌停价")
+
+
 def test_financials_asof_is_point_in_time():
     p, dates = _panel(n_days=5)
     mgr = JQData(p, dates[0], dates[-1])
@@ -339,6 +391,46 @@ def test_financials_asof_is_point_in_time():
     c = mgr.financials_asof("2024-04-01")
     assert c.empty, "公告前不应有任何数据（前视）"
     print("[OK] financials_asof 按 ann_date 对齐：公告前为空、公告后取最新一期")
+
+
+def test_profit_glob_is_limited_to_profit_sheet():
+    """财务 glob **必须**限定 profit_*
+
+    回归测试。曾经写成 `year=*/*.parquet`（为了在无 db 的 CI 里不抛异常），
+    于是把 balance/cashflow/profit 三张同目录报表一起读进来、`union_by_name`
+    补齐列，同一份报告变成三行；再按 (code, end_date) 去重 keep="first" 就
+    **系统性留下资产负债表那一行** -> `get_fundamentals` 的 income 字段全 NaN
+    -> 两个移植策略的选股结果恒为空 -> 全程空仓买货币 ETF（本地 +2.36% vs
+    聚宽 +185.52% 的真正原因）。
+
+    这个测试断言的是**模式串**，不是"跑一遍看结果"，所以没有 db 也能拦住回归。
+    """
+    from joinquant.data import profit_parquet_glob
+    g = profit_parquet_glob()
+    assert g.endswith("/year=*/profit_*.parquet"), f"glob 没限定利润表：{g}"
+    assert "balance_" not in g and "cashflow_" not in g
+    print(f"[OK] 财务 glob 限定在利润表：{g}")
+
+
+def test_financials_asof_has_values_when_db_present():
+    """有 db 时利润表字段**不能整列为空**（上面那个 bug 的直接症状）"""
+    from database.config import FROZEN_ROOT
+    if not any((FROZEN_ROOT / "financial").glob("year=*/profit_*.parquet")):
+        print("[SKIP] 无 frozen/financial，跳过")
+        return
+    p, dates = _panel(n_days=5)
+    mgr = JQData(p, dates[0], dates[-1])
+    if mgr._fin.empty:
+        print("[SKIP] 利润表读出来为空，跳过")
+        return
+    asof = mgr.financials_asof("2024-06-30")
+    assert not asof.empty, "2024-06-30 应该能看到已公告财报"
+    for col in ("revenue", "n_income", "n_income_attr_p"):
+        n_ok = int(asof[col].notna().sum())
+        assert n_ok > 0.5 * len(asof), \
+            f"{col} 非空仅 {n_ok}/{len(asof)} —— 大概率又读到了非利润表的行"
+    print(f"[OK] 利润表字段非空（{len(asof)} 只，revenue 非空 "
+          f"{int(asof['revenue'].notna().sum())}）")
 
 
 def test_etf_close_prefers_real_then_synthetic():
@@ -505,12 +597,16 @@ if __name__ == "__main__":
     test_limit_up_blocks_buy()
     test_history_daily_excludes_today()
     test_get_price_respects_end_date()
+    test_get_price_intraday_fields_are_not_all_nan()
+    test_unknown_history_field_is_nan_not_close()
     test_current_data_fields()
     test_query_dsl_filters_and_sort()
     test_query_in_filter()
     test_index_proxy_rules()
     test_index_proxy_excludes_unlisted()
     test_financials_asof_is_point_in_time()
+    test_profit_glob_is_limited_to_profit_sheet()
+    test_financials_asof_has_values_when_db_present()
     test_etf_close_prefers_real_then_synthetic()
     test_positions_returns_zero_for_unheld()
     test_get_price_supports_index_and_etf()

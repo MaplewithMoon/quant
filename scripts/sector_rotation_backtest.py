@@ -644,6 +644,19 @@ def main():
     if not tr.empty:
         save_csv(tr, os.path.join(args.outdir, "trades.csv"), index_label="idx")
         print(f"  成交明细 -> {os.path.join(args.outdir, 'trades.csv')}")
+        # 聚宽风格的「交易记录」+「收益分析」+「成交回合」（见 analytics/trade_log.py）
+        from analytics.trade_log import audit_line, export_trade_log
+        from execution.setup import FILL_SAME_CLOSE
+        tl = export_trade_log(
+            tr, eq, bench_full.reindex(eq.index), outdir=args.outdir,
+            tag="_sector_rotation",
+            rejects=getattr(res, "rejection_detail", None),
+            initial_cash=args.capital,
+            fill_time="15:00" if args.fill_timing == FILL_SAME_CLOSE else "09:30",
+            label=f"板块动量轮动  {split.start} ~ {split.end}")
+        print(f"  交易记录 -> {tl['files']['交易记录']}")
+        print(f"  收益分析 -> {tl['files']['收益分析']}")
+        print(audit_line(tl["audit"]))
 
     # 逐日持仓（只存调仓日，全量 2600×5700 太大）与板块暴露，便于事后复盘
     reb_w = plan.weights.dropna(how="all")
