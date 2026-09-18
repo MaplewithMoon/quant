@@ -312,9 +312,39 @@ def trade_records_text(trades: pd.DataFrame, names: Dict[str, str] = None) -> st
     return "\n".join(lines) + "\n"
 
 
+def jq_sharpe(summ: Dict, rf: float = 0.04) -> float:
+    """聚宽口径的夏普比率
+
+    **和本项目的夏普不是一回事**，直接并排比会得出错误结论：
+
+        本项目 : mean(日收益) / std(日收益) * sqrt(252)，rf=0（算术年化）
+        聚    宽: (几何年化收益 - 4%) / 年化波动率
+
+    用平台导出值反解可以确认后者：v1 (71.74%−4%)/31.80% = **2.130** vs 平台报告
+    2.129；v2 (83.89%−4%)/22.40% = **3.567** vs 平台报告 3.573。两个都对得上。
+    """
+    vol = summ.get("annual_volatility")
+    if not vol:
+        return float("nan")
+    return float((summ.get("annual_return", float("nan")) - rf) / vol)
+
+
+def jq_sortino(returns: pd.Series, summ: Dict, rf: float = 0.04) -> float:
+    """聚宽口径的索提诺比率（同样用几何年化收益与 4% 无风险利率）"""
+    from .jq_report import downside_risk
+    dr = downside_risk(returns, mar=rf)
+    if not dr:
+        return float("nan")
+    return float((summ.get("annual_return", float("nan")) - rf) / dr)
+
+
 def perf_analysis_text(equity: pd.Series, benchmark: pd.Series = None,
                        trades: pd.DataFrame = None, label: str = "") -> str:
-    """聚宽「收益分析」同构文本（每行：指标名 / 值）"""
+    """聚宽「收益分析」同构文本（每行：指标名 / 值）
+
+    夏普 / 索提诺**同时给两种口径**：本项目的（rf=0，日收益算术均值年化）与
+    聚宽的（几何年化 − 4% 再除波动率）。不给两个数字的话，和平台并排看必然误判。
+    """
     from .jq_report import trade_stats
     e = pd.Series(equity).astype(float).dropna()
     r = to_returns(e)
@@ -336,7 +366,9 @@ def perf_analysis_text(equity: pd.Series, benchmark: pd.Series = None,
         ("策略年化收益", pct(summ["annual_return"], True)),
         ("策略波动率", num(summ["annual_volatility"])),
         ("夏普比率", num(summ["sharpe_ratio"])),
+        ("夏普比率(聚宽口径)", num(jq_sharpe(summ))),
         ("索提诺比率", num(summ["sortino_ratio"])),
+        ("索提诺比率(聚宽口径)", num(jq_sortino(r, summ))),
         ("最大回撤", pct(summ["max_drawdown"])),
         ("最大回撤区间", f"{summ.get('max_drawdown_peak','')},{summ.get('max_drawdown_trough','')}"),
     ]
@@ -373,6 +405,8 @@ def perf_analysis_text(equity: pd.Series, benchmark: pd.Series = None,
         ("卡玛比率", num(summ["calmar_ratio"])),
         ("最大回撤持续(天)", f"{summ.get('max_drawdown_duration', 0)}"),
         ("最大回撤收复日", str(summ.get("max_drawdown_recover", ""))),
+        ("口径说明", "「夏普比率/索提诺比率」= 日收益算术均值年化、rf=0；"
+                     "「(聚宽口径)」= (几何年化收益−4%)/年化波动率。两者不可直接比"),
     ]
     lines: List[str] = []
     for k, v in pairs:

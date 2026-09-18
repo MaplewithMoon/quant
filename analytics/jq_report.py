@@ -294,7 +294,13 @@ def build_jq_report(equity: pd.Series, benchmark: pd.Series, title: str,
 </div>
 {warn}
 <div class="panel"><h2>说明</h2><div class="note">
-策略收益与基准收益按复利计算；夏普用无风险利率 0（聚宽默认 0）；
+策略收益与基准收益按复利计算；
+⚠️ **夏普/索提诺是两个不同口径，别和聚宽页面对不上就以为算错了** ——
+本报告用「日收益算术均值年化、无风险利率 0」（`analytics/performance.py`）；
+聚宽用的是「**几何**年化收益 − **4%** 无风险利率，再除年化波动率」
+（用平台导出值反解验证：v1 (71.74%−4%)/31.80% = 2.130 vs 报告 2.129，
+v2 (83.89%−4%)/22.40% = 3.567 vs 报告 3.573）。
+`analytics/trade_log.py::perf_analysis_text` 会**同时**给出两种口径；
 Alpha/Beta 为日频 CAPM 回归（Alpha 年化 = 日截距 × 252）；
 波动率、下行风险、跟踪误差均按 252 交易日年化；
 盈亏比 = 平均盈利 / |平均亏损|（只统计已平仓交易）。
