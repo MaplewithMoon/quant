@@ -126,6 +126,10 @@ extend-exclude = [
     # strategies/jq/*.py 才需要检查，它们在文件头自带 `# ruff: noqa`。
     "动态持仓 止损线9 单价不超过50-Clone.py",
     "添加399101可选-Clone.py",
+    # 聚宽**平台原生版**策略（scripts/gen_jq_platform.py 的产物，给人复制到
+    # 平台上跑）。它们同样以 `from jqdata import *` 开头、主体与平台原版一致，
+    # 会有大量平台 API 告警，且**本地跑不了**（没有 jqdata 模块）。
+    "jq_platform",
 ]
 
 [tool.ruff.lint]

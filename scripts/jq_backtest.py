@@ -77,6 +77,14 @@ def main():
           f"成交价 {args.fill}   制度约束 {'关' if args.no_rules else '开'}")
     print(f"  滑点 {args.slippage:.2%}   冲击模型 {args.impact_model}"
           + (f"(k={args.impact_k})" if args.impact_model == "sqrt" else ""))
+    # ⚠️ 上面这行是**命令行默认值**，不是实际生效值。
+    # 策略内部有自己的 `set_slippage(FixedSlippage(...))` / `set_order_cost(...)`，
+    # 而 `JQEngine.run()` 是在 `initialize()` **之后**才 `_rebuild_broker()`，
+    # 所以**策略里写的会覆盖这里**（聚宽语义）。
+    # 实测本仓库两个策略都用 `FixedSlippage(3/10000)` = 0.03%，
+    # 与上面显示的 0.10% 不同 —— 不写这一句，读报告的人会拿错口径去和聚宽比。
+    print("  ↑ 这是**默认值**；策略内的 set_slippage/set_order_cost 会覆盖它"
+          "（以策略里写的为准）")
 
     banner("1. 加载数据", "-")
     t1 = time.time()
