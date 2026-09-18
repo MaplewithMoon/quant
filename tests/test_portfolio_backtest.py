@@ -250,6 +250,39 @@ def test_correlation_matrix_different_column_sets():
     print(f"[OK] 列空间不同的因子也能算相关：{v:+.3f}（回归：掩码 NaN 崩溃）")
 
 
+def test_align_to_unifies_all_tables():
+    """回归：`align_to` 必须把**所有**宽表对齐到 close 的轴，不只是状态表
+
+    真实场景：某只股票在区间内**有行情但没有估值记录**（实测 601006 在
+    2023-2024），`total_mv`/`pb` 会少一列。所有下游代码都默认
+    "panel 里每张表都与 close 同形状"，于是
+    `build_target_weights(..., mv=panel["total_mv"])` 在
+    `out.loc[reb] = w.reindex(reb)` 上抛
+    `ValueError: setting an array element with a sequence`
+    —— 报错完全指不到真正的原因（缺一列），排查成本极高。
+
+    缺数据的位置应当是 **NaN**，而不是"少一列"。
+    """
+    from backtest.panel_data import align_to
+    p = _panel(n_days=20, n_codes=10, seed=11)
+    idx, codes = p["close"].index, list(p["close"].columns)
+    p["total_mv"] = pd.DataFrame(1e5, index=idx, columns=codes[:8])   # 少 2 列
+    p["pb"] = pd.DataFrame(2.0, index=idx, columns=codes)             # 正常
+    out = align_to(p, idx, codes)
+    assert out["total_mv"].shape == p["close"].shape, out["total_mv"].shape
+    assert out["total_mv"][codes[8]].isna().all(), "补的列应当是 NaN"
+    assert out["total_mv"][codes[0]].notna().all()
+
+    # 真的能用（原先这一句就是崩溃点）
+    score = pd.DataFrame(np.arange(20 * 10, dtype=float).reshape(20, 10),
+                         index=idx, columns=codes)
+    mask = pd.DataFrame(True, index=idx, columns=codes)
+    tw = build_target_weights(score, mask, n_hold=5, weighting="market_cap",
+                              mv=out["total_mv"], rebalance="W", quantile=0.3)
+    assert tw.notna().any().any()
+    print("[OK] align_to 统一所有宽表的轴；缺数据的票补 NaN 而不是少一列")
+
+
 if __name__ == "__main__":
     test_weight_schemes_sum_to_one()
     test_cap_weights()
@@ -264,4 +297,5 @@ if __name__ == "__main__":
     test_composite_direction_alignment()
     test_composite_equal_weight()
     test_correlation_matrix_different_column_sets()
+    test_align_to_unifies_all_tables()
     print("\n全部组合构建/多标的回测测试通过")

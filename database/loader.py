@@ -60,6 +60,12 @@ def load_factor(code: str) -> pd.DataFrame:
 def to_qfq(daily: pd.DataFrame, factor: pd.DataFrame = None) -> pd.DataFrame:
     """把原始价日线转换为前复权价（量额不变）
     前复权价 = 原始价 × qfq_factor   (qfq_factor 最新=1)
+
+    ⚠️ `pre_close` **一并缩放**。原先只缩放 open/high/low/close，`pre_close`
+    留着原始价 —— 于是同一行里 `close` 是前复权、`pre_close` 是不复权，
+    自己算 `close/pre_close-1` 会得到一个毫无意义的数（实测 600519
+    2024-06-03 差 9 个百分点）。`change`/`pct_chg` 是**比率**，缩放后不变，
+    保持原值即可。
     """
     df = daily.copy()
     if factor is None or factor.empty:
@@ -70,8 +76,9 @@ def to_qfq(daily: pd.DataFrame, factor: pd.DataFrame = None) -> pd.DataFrame:
         df.sort_values("trade_date"), f, on="trade_date", direction="backward"
     )
     merged["factor"] = merged["factor"].fillna(1.0)
-    for c in ["open", "high", "low", "close"]:
-        df[c] = (df[c] * merged["factor"].values).round(4)
+    for c in ["open", "high", "low", "close", "pre_close"]:
+        if c in df.columns:
+            df[c] = (df[c] * merged["factor"].values).round(4)
     return df
 
 
@@ -227,33 +234,38 @@ def industry_median_factor(factor_col: str, date: str, industry_col: str = "indu
     """策略3: 计算某日各行业的因子中位数，用于填充缺失值
     基于 frozen 层 valuation（各股票因子）+ stocks 行业归属
     返回: {行业: 中位数值}
+
+    ⚠️ 原先实现有两个问题：
+    1. **恒返回空字典** —— `load_industry_map()` 的列是 `ts_code`（'000001.SZ'
+       带后缀），而 valuation 的 `code` 是裸 6 位，merge 的左右键对不上，
+       行业全为 NaN，groupby(dropna) 之后什么都不剩。这里先拆成裸 6 位再合并。
+    2. **用 pandas 逐个读 7 万多个 parquet**，实测 5 分钟都跑不完。改成
+       DuckDB 直接查该年份的分区（按 `trade_date` 过滤，只物化一天的数据）。
     """
-    import numpy as np
-    from .downloader.tushare_client import get_client
-    # 加载该日全部股票因子
-    files = list((DB / "frozen" / "valuation").glob("year=*/*.parquet"))
-    if not files:
+    from database.config import FROZEN_ROOT, connect_duckdb, year_globs
+    y = pd.Timestamp(date).year
+    glob = year_globs(FROZEN_ROOT / "valuation", y, y)
+    if glob == "[]":
         return {}
-    dfs = []
-    for f in files:
-        df = pd.read_parquet(f, columns=["code", "trade_date", factor_col])
-        df["trade_date"] = pd.to_datetime(df["trade_date"])
-        dfs.append(df)
-    val = pd.concat(dfs, ignore_index=True)
-    val = val[val["trade_date"] == pd.to_datetime(date)]
+    con = connect_duckdb()
+    try:
+        val = con.execute(
+            f"SELECT code, {factor_col} FROM read_parquet({glob}) "
+            f"WHERE trade_date = ?", [pd.Timestamp(date)]).fetchdf()
+    finally:
+        con.close()
     if val.empty:
         return {}
-    # 行业归属
     ind = load_industry_map()
-    if ind.empty or "code" not in ind.columns:
+    if ind.empty or industry_col not in ind.columns:
         return {}
-    ind_code = "code" if "code" in ind.columns else ind.columns[0]
-    merged = val.merge(ind[[ind_code, industry_col]] if industry_col in ind.columns
-                       else ind[[ind_code]], left_on="code", right_on=ind_code, how="left")
-    if industry_col not in merged.columns:
-        return {}
-    result = merged.groupby(industry_col)[factor_col].median().dropna().to_dict()
-    return result
+    ind = ind.copy()
+    src = "code" if "code" in ind.columns else "ts_code"
+    ind["code"] = ind[src].astype(str).str.split(".").str[0].str.zfill(6)
+    val["code"] = val["code"].astype(str).str.zfill(6)
+    merged = val.merge(ind[["code", industry_col]].drop_duplicates("code"),
+                       on="code", how="left")
+    return merged.groupby(industry_col)[factor_col].median().dropna().to_dict()
 
 
 def load_industry_map() -> pd.DataFrame:

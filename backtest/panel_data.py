@@ -90,10 +90,23 @@ def load_status_panels(start: str, end: str, codes=None) -> dict:
 
 
 def align_to(panel: dict, ref_index, ref_columns) -> dict:
-    """把状态面板对齐到价量面板的日期与股票轴"""
-    for k in ("limit_up", "limit_down", "suspended"):
-        if k in panel:
-            panel[k] = panel[k].reindex(index=ref_index, columns=ref_columns)
+    """把面板里**所有**宽表对齐到价量面板的日期与股票轴
+
+    ⚠️ 原先只对齐 `limit_up` / `limit_down` / `suspended` 三张状态表，
+    **估值表没对齐**。于是当某只股票在区间内**有行情但没有估值记录**时
+    （实测 601006 在 2023-2024 就是这样），`total_mv` / `pd` / `pb` 会少一列，
+    而所有下游代码都默认"panel 里每张表都与 close 同形状" ——
+    于是 `build_target_weights(..., mv=panel["total_mv"])` 会在
+    `out.loc[reb] = w.reindex(reb)` 上抛
+    `ValueError: setting an array element with a sequence`，
+    报错信息完全指不到真正的原因（缺一列）。
+
+    这里统一成"所有宽表同轴"，缺数据的位置是 NaN —— **NaN 比少一列好**：
+    少一列是形状错误会炸，NaN 只会让那天的该股票算不出权重。
+    """
+    for k, v in list(panel.items()):
+        if isinstance(v, pd.DataFrame):
+            panel[k] = v.reindex(index=ref_index, columns=ref_columns)
     if "suspended" in panel:
         panel["suspended"] = panel["suspended"].fillna(False).astype(bool)
     return panel
@@ -181,6 +194,14 @@ def _read_panel_cache(cache_dir: str, start: str, end: str):
             return None
         if len(panel) != len(meta["tables"]):
             return None
+        # 每张宽表都必须与 close 同轴。缓存里的表若是"少一列"的形状（估值表曾因
+        # 某只股票无记录而少列），下游会以 `ValueError: setting an array element
+        # with a sequence` 这种完全指不到原因的方式炸掉 —— 宁可这里重新加载。
+        for name, t in panel.items():
+            if isinstance(t, pd.DataFrame) and t.shape != close.shape:
+                print(f"  [缓存已失效：{name} 与 close 不同形状 "
+                      f"{t.shape} vs {close.shape}] 重新加载")
+                return None
         print(f"  [使用面板缓存] 构建于 {meta.get('built_at', '未知时间')}，"
               f"{meta.get('n_days')} 交易日 × {meta.get('n_codes')} 只股票"
               f"（数据指纹已校验一致；要强制重载请加 --refresh-cache）")

@@ -49,6 +49,7 @@ DEFAULT = (
     "tests/test_alert.py",              # 告警（合成）
     "tests/test_regression_baseline.py",  # 回归基准 + 快照（合成）
     "tests/test_trade_log.py",          # 交易记录导出（合成；名称表拿不到就用代码）
+    "tests/test_portfolio_backtest.py",  # 组合构建 + 撮合（合成面板）
 )
 MARK = "__OFFLINE_RESULT__"
 

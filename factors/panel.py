@@ -124,6 +124,14 @@ def load_panel(start: str, end: str, codes: list = None,
         val = val.drop_duplicates(["code", "trade_date"])
         vp = _to_wide(val, [c for c in val.columns if c not in ("code", "trade_date")])
         panel.update(vp)
+    # ⚠️ 统一股票轴：估值表是按"有记录才成列"建的，某只股票在区间内**有行情但没估值**
+    # 时（实测 601006 2023-2024）会少一列，让所有下游代码的"panel 各表同形状"
+    # 假设失效 —— 症状是 `build_target_weights(..., mv=panel["total_mv"])` 抛
+    # `ValueError: setting an array element with a sequence`，完全指不到原因。
+    # 缺数据的位置补 NaN（形状错误会炸，NaN 只是算不出权重）。
+    ref_i, ref_c = panel["close"].index, panel["close"].columns
+    for k in list(panel):
+        panel[k] = panel[k].reindex(index=ref_i, columns=ref_c)
     return panel
 
 
